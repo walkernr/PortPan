@@ -108,16 +108,25 @@ class BoundingBox(BaseModel):
 
 
 class CircleAperture(BaseModel):
-    """Detected circular optical aperture in a digiscope capture."""
+    """Detected optical aperture in a digiscope capture with sub-pixel chroma boundary polygon."""
 
     center_x: float = Field(ge=0.0, description="Center X coordinate in pixels")
     center_y: float = Field(ge=0.0, description="Center Y coordinate in pixels")
-    radius: float = Field(gt=0.0, description="Radius in pixels")
+    radius: float = Field(gt=0.0, description="Effective mean radius in pixels")
     image_width: int = Field(gt=0, description="Width of source image")
     image_height: int = Field(gt=0, description="Height of source image")
+    boundary_polygon: list[list[float]] | None = Field(
+        default=None, description="Sub-pixel boundary contour coordinates [[x0, y0], [x1, y1], ...] around chromatic ring"
+    )
+    ellipse_axes: tuple[float, float] | None = Field(
+        default=None, description="Fitted ellipse (major_axis, minor_axis) in pixels"
+    )
+    ellipse_angle: float | None = Field(
+        default=None, description="Fitted ellipse rotation angle in degrees"
+    )
 
     def get_inscribed_square(self, safety_margin: float = 0.05) -> tuple[int, int, int, int]:
-        """Compute the pixel coordinates (x1, y1, x2, y2) of the largest square inside the circle.
+        """Compute the pixel coordinates (x1, y1, x2, y2) of the largest square inside the aperture.
 
         Args:
             safety_margin: Fraction of radius to shrink inwardly to stay clear of vignette falloff.
@@ -136,23 +145,34 @@ class CircleAperture(BaseModel):
 
         return (x1, y1, x2, y2)
 
-    def generate_mask(self, feather_px: int = 3) -> np.ndarray:
-        """Generate a 2D uint8 alpha mask (0-255) with anti-aliased / feathered circular edge."""
+    def generate_mask(self, feather_px: float = 2.0) -> np.ndarray:
+        """Generate a 2D uint8 alpha mask (0-255) perfectly preserving the chromatic aberration ring with anti-aliasing."""
         import cv2
 
         mask = np.zeros((self.image_height, self.image_width), dtype=np.uint8)
-        center = (int(round(self.center_x)), int(round(self.center_y)))
-        radius_int = int(round(self.radius))
 
-        # Draw solid circle
-        cv2.circle(mask, center, radius_int, 255, -1, lineType=cv2.LINE_AA)
+        if self.boundary_polygon and len(self.boundary_polygon) >= 3:
+            pts = np.array(self.boundary_polygon, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.fillPoly(mask, [pts], 255, lineType=cv2.LINE_AA)
+        else:
+            center = (int(round(self.center_x)), int(round(self.center_y)))
+            radius_int = int(round(self.radius))
+            cv2.circle(mask, center, radius_int, 255, -1, lineType=cv2.LINE_AA)
 
         if feather_px > 0:
-            # Gaussian blur for soft anti-aliased alpha edge
-            ksize = feather_px * 2 + 1
+            ksize = int(round(feather_px * 2)) | 1  # ensure odd kernel size
             mask = cv2.GaussianBlur(mask, (ksize, ksize), feather_px / 2.0)
 
         return mask
+
+    def extract_rgba(self, image: np.ndarray, feather_px: float = 2.0) -> np.ndarray:
+        """Extract a transparent 4-channel BGRA/RGBA porthole image retaining the full chromatic boundary."""
+        import cv2
+
+        mask = self.generate_mask(feather_px=feather_px)
+        bgra = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA) if len(image.shape) == 3 and image.shape[2] == 3 else image.copy()
+        bgra[:, :, 3] = mask
+        return bgra
 
 
 class RegistrationResult(BaseModel):

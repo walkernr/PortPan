@@ -25,7 +25,7 @@ from portpan.localization.heuristic_localizer import HeuristicLocalizer
 from portpan.matching.base import BaseDenseMatcher
 from portpan.matching.opencv_matcher import OpenCVMatcher
 from portpan.segmentation.base import BaseApertureSegmenter
-from portpan.segmentation.circle_segmenter import RobustCircleSegmenter
+from portpan.segmentation.polar_segmenter import PolarChromaSegmenter
 from portpan.video.stabilizer_offset import VideoStabilizerOffsetEstimator
 
 logger = logging.getLogger("portpan.pipeline")
@@ -43,7 +43,7 @@ class RegistrationPipeline:
         video_offset_estimator: VideoStabilizerOffsetEstimator | None = None,
         audit_dir: Path | str | None = "output/audit",
     ) -> None:
-        self.segmenter = segmenter or RobustCircleSegmenter()
+        self.segmenter = segmenter or PolarChromaSegmenter()
         self.localizer = localizer or HeuristicLocalizer()
         self.matcher = matcher or OpenCVMatcher()
         self.validator = validator or GeometricValidator()
@@ -122,6 +122,7 @@ class RegistrationPipeline:
 
             if self.auditor and generate_audit_images:
                 self.auditor.draw_aperture_debug(target_img, aperture, inscribed_box, f"{loc_name}_{img_path.stem}")
+                self.auditor.export_isolated_porthole(target_img, aperture, f"{loc_name}_{img_path.stem}")
 
             # Step 2: Semantic Coarse Localization
             candidate_boxes = self.localizer.localize(base_canvas, inscribed_crop)

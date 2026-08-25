@@ -4,6 +4,7 @@ import cv2
 import numpy as np
 import pytest
 from portpan.segmentation.circle_segmenter import RobustCircleSegmenter
+from portpan.segmentation.polar_segmenter import PolarChromaSegmenter
 
 
 def test_segmenter_synthetic_circle():
@@ -23,11 +24,26 @@ def test_segmenter_synthetic_circle():
     assert crop.shape[1] > 0
 
 
-def test_segmenter_full_frame():
-    # Uniform white image with bright corners
-    img = np.full((600, 800, 3), 180, dtype=np.uint8)
-    segmenter = RobustCircleSegmenter()
+def test_polar_chroma_segmenter_synthetic():
+    # Create canvas with chromatic aberration ring
+    img = np.zeros((800, 1000, 3), dtype=np.uint8)
+    # Core scene (neutral)
+    cv2.circle(img, (500, 400), 280, (180, 180, 180), -1)
+    # Outer chromatic fringe (blue/cyan ring)
+    cv2.circle(img, (500, 400), 310, (240, 150, 40), 25)
+
+    segmenter = PolarChromaSegmenter()
     aperture = segmenter.segment(img)
 
-    assert aperture.center_x == pytest.approx(400, abs=5)
-    assert aperture.center_y == pytest.approx(300, abs=5)
+    assert aperture.center_x == pytest.approx(500, abs=15)
+    assert aperture.center_y == pytest.approx(400, abs=15)
+    assert aperture.boundary_polygon is not None
+    assert len(aperture.boundary_polygon) == 360
+
+    # Test RGBA extraction
+    rgba = aperture.extract_rgba(img, feather_px=2.0)
+    assert rgba.shape == (800, 1000, 4)
+    # Center should be opaque
+    assert rgba[400, 500, 3] == 255
+    # Outer corners should be completely transparent
+    assert rgba[10, 10, 3] == 0

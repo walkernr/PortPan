@@ -42,12 +42,14 @@ class GeometricValidator:
         if inlier_count < self.min_inliers:
             return False, f"Insufficient inliers ({inlier_count} < {self.min_inliers})", None
 
-        # Adaptive inlier ratio check: large absolute inlier counts (e.g. >= 50) have near-zero false positive probability
+        # Adaptive inlier ratio check: large absolute inlier counts (e.g. >= 25) have near-zero false positive probability
         effective_min_ratio = self.min_inlier_ratio
-        if inlier_count >= 60:
-            effective_min_ratio = min(effective_min_ratio, 0.08)
-        elif inlier_count >= 35:
-            effective_min_ratio = min(effective_min_ratio, 0.10)
+        if inlier_count >= 50:
+            effective_min_ratio = min(effective_min_ratio, 0.06)
+        elif inlier_count >= 25:
+            effective_min_ratio = min(effective_min_ratio, 0.075)
+        elif inlier_count >= 15:
+            effective_min_ratio = min(effective_min_ratio, 0.12)
 
         if inlier_ratio < effective_min_ratio:
             return False, f"Inlier ratio too low ({inlier_ratio:.3f} < {effective_min_ratio:.3f})", None

@@ -17,6 +17,19 @@ class VisualAuditor:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         (self.output_dir / "apertures").mkdir(parents=True, exist_ok=True)
         (self.output_dir / "matches").mkdir(parents=True, exist_ok=True)
+        (self.output_dir / "isolated_portholes").mkdir(parents=True, exist_ok=True)
+
+    def export_isolated_porthole(
+        self,
+        image: np.ndarray,
+        aperture: CircleAperture,
+        filename_prefix: str,
+    ) -> Path:
+        """Export a 32-bit transparent RGBA PNG porthole with preserved chromatic ring."""
+        bgra = aperture.extract_rgba(image, feather_px=2.0)
+        out_path = self.output_dir / "isolated_portholes" / f"{filename_prefix}_porthole.png"
+        cv2.imwrite(str(out_path), bgra)
+        return out_path
 
     def draw_aperture_debug(
         self,
@@ -28,16 +41,38 @@ class VisualAuditor:
         """Save a visualization of the detected optical aperture and inscribed square."""
         debug_img = image.copy()
         h, w = debug_img.shape[:2]
+        line_w = max(2, int(w * 0.002))
 
-        # Draw circle in vibrant green
+        # 1. Draw sub-pixel boundary polygon hugging chromatic fringe
+        if aperture.boundary_polygon and len(aperture.boundary_polygon) >= 3:
+            poly_pts = np.array(aperture.boundary_polygon, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(debug_img, [poly_pts], isClosed=True, color=(0, 255, 0), thickness=line_w, lineType=cv2.LINE_AA)
+
+        # 2. Draw fitted circle or ellipse in thin cyan
         center = (int(round(aperture.center_x)), int(round(aperture.center_y)))
-        radius = int(round(aperture.radius))
-        cv2.circle(debug_img, center, radius, (0, 255, 0), max(2, int(w * 0.002)), lineType=cv2.LINE_AA)
+        if aperture.ellipse_axes and aperture.ellipse_angle is not None:
+            ax1, ax2 = aperture.ellipse_axes
+            axes = (int(round(ax1 / 2.0)), int(round(ax2 / 2.0)))
+            cv2.ellipse(
+                debug_img,
+                center,
+                axes,
+                aperture.ellipse_angle,
+                0,
+                360,
+                (255, 255, 0),
+                max(1, line_w // 2),
+                lineType=cv2.LINE_AA,
+            )
+        else:
+            radius = int(round(aperture.radius))
+            cv2.circle(debug_img, center, radius, (255, 255, 0), max(1, line_w // 2), lineType=cv2.LINE_AA)
+
         cv2.circle(debug_img, center, max(4, int(w * 0.004)), (0, 0, 255), -1)
 
-        # Draw inscribed square in vibrant cyan
+        # 3. Draw inscribed square in vibrant amber
         x1, y1, x2, y2 = inscribed_box
-        cv2.rectangle(debug_img, (x1, y1), (x2, y2), (255, 255, 0), max(2, int(w * 0.002)), lineType=cv2.LINE_AA)
+        cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 180, 255), line_w, lineType=cv2.LINE_AA)
 
         out_path = self.output_dir / "apertures" / f"{filename_prefix}_aperture.jpg"
         cv2.imwrite(str(out_path), debug_img)
@@ -151,8 +186,8 @@ class VisualAuditor:
             aperture = apertures_map[name]
             H_global = res.get_matrix_np()
 
-            # Generate feathered mask
-            mask = aperture.generate_mask(feather_px=4).astype(np.float32) / 255.0
+            # Generate exact chroma-preserving feathered mask
+            mask = aperture.generate_mask(feather_px=2.0).astype(np.float32) / 255.0
 
             # Apply mask to target image
             masked_target = target_img.astype(np.float32) * mask[:, :, np.newaxis]
@@ -174,9 +209,6 @@ class VisualAuditor:
                 borderMode=cv2.BORDER_CONSTANT,
                 borderValue=0.0,
             )
-
-            # Draw a subtle porthole ring boundary in gold/brass
-            pts = np.array(res.bounding_box_in_base, dtype=np.int32).reshape((-1, 1, 2)) if res.bounding_box_in_base else None
 
             # Alpha blend into master canvas
             m3 = np.clip(warped_mask[:, :, np.newaxis], 0.0, 1.0)

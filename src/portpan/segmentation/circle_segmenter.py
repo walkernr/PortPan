@@ -1,4 +1,4 @@
-"""Robust circular aperture segmentation using adaptive thresholding and contour fitting."""
+"""Robust circular aperture segmentation using adaptive thresholding, morphological contour analysis, and least-squares circle fitting."""
 
 from __future__ import annotations
 
@@ -15,8 +15,8 @@ class RobustCircleSegmenter(BaseApertureSegmenter):
     def __init__(
         self,
         min_radius_ratio: float = 0.25,
-        max_radius_ratio: float = 1.60,
-        dark_corner_threshold: float = 50.0,
+        max_radius_ratio: float = 0.65,
+        dark_corner_threshold: float = 65.0,
     ) -> None:
         self.min_radius_ratio = min_radius_ratio
         self.max_radius_ratio = max_radius_ratio
@@ -30,7 +30,7 @@ class RobustCircleSegmenter(BaseApertureSegmenter):
         h, w = image.shape[:2]
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
 
-        # Check if corners are dark (indicating barrel vignetting)
+        # Check corner vignetting
         corner_w = max(5, w // 20)
         corner_h = max(5, h // 20)
         corner_means = [
@@ -42,67 +42,91 @@ class RobustCircleSegmenter(BaseApertureSegmenter):
         avg_corner = float(np.mean(corner_means))
         center_mean = float(np.mean(gray[h // 4 : 3 * h // 4, w // 4 : 3 * w // 4]))
 
-        # If corners are bright relative to center, the image might not have a vignette aperture
-        if avg_corner > self.dark_corner_threshold and avg_corner > 0.8 * center_mean:
-            # Fallback to full frame inscribed circle
-            cx, cy = w / 2.0, h / 2.0
-            r = min(w, h) / 2.0
-            return CircleAperture(
-                center_x=cx,
-                center_y=cy,
-                radius=r,
-                image_width=w,
-                image_height=h,
-            )
-
-        # Strategy 1: Multi-threshold contour search on downsampled image
+        # Downsample for fast and robust contour extraction
         target_dim = 800
         scale = target_dim / max(w, h) if max(w, h) > target_dim else 1.0
         small_gray = cv2.resize(gray, (int(w * scale), int(h * scale))) if scale < 1.0 else gray.copy()
         sh, sw = small_gray.shape[:2]
 
-        # Slight blur to remove sensor noise
-        blurred = cv2.GaussianBlur(small_gray, (9, 9), 2.0)
+        blurred = cv2.GaussianBlur(small_gray, (11, 11), 2.0)
 
-        # Try multiple threshold values to find the cleanest aperture contour
+        # Compute Otsu baseline
+        otsu_val, _ = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        thresh_candidates = sorted(
+            list(
+                set(
+                    [
+                        max(10, int(otsu_val * 0.4)),
+                        max(15, int(otsu_val * 0.6)),
+                        max(20, int(otsu_val * 0.8)),
+                        int(otsu_val),
+                        30,
+                        40,
+                        50,
+                        65,
+                        80,
+                    ]
+                )
+            )
+        )
+
+        min_r = min(w, h) * self.min_radius_ratio
+        max_r = min(w, h) * self.max_radius_ratio
+
         best_circle: tuple[float, float, float] | None = None
         best_score = -1.0
 
-        for thresh_val in [15, 25, 40, 60]:
+        for thresh_val in thresh_candidates:
             _, binary = cv2.threshold(blurred, thresh_val, 255, cv2.THRESH_BINARY)
-            # Morphological close to bridge small gaps and fill pinhole reflections
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
             closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
             contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours:
-                continue
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                perimeter = cv2.arcLength(cnt, True)
+                if perimeter <= 0 or area <= 0:
+                    continue
 
-            largest = max(contours, key=cv2.contourArea)
-            area = cv2.contourArea(largest)
-            perimeter = cv2.arcLength(largest, True)
-            if perimeter <= 0 or area <= 0:
-                continue
+                # Reject contours that hug the full image frame border
+                bx, by, bw, bh = cv2.boundingRect(cnt)
+                if bw >= sw * 0.96 and bh >= sh * 0.96:
+                    continue
 
-            # Circularity: 4 * pi * area / perimeter^2 (1.0 for perfect circle)
-            circularity = (4.0 * np.pi * area) / (perimeter * perimeter)
-            (scx, scy), sr = cv2.minEnclosingCircle(largest)
+                circularity = (4.0 * np.pi * area) / (perimeter * perimeter)
+                (scx, scy), sr = cv2.minEnclosingCircle(cnt)
 
-            # Map back to original scale
-            orig_cx = scx / scale
-            orig_cy = scy / scale
-            orig_r = sr / scale
+                orig_cx = scx / scale
+                orig_cy = scy / scale
+                orig_r = sr / scale
 
-            # Score candidates based on area, circularity, and proximity to image center
-            min_r = min(w, h) * self.min_radius_ratio
-            max_r = max(w, h) * self.max_radius_ratio
+                if min_r <= orig_r <= max_r:
+                    # Prefer high circularity and plausible optical center proximity
+                    center_dist = np.hypot(orig_cx - w / 2.0, orig_cy - h / 2.0) / max(w, h)
+                    score = circularity * (1.0 - 0.25 * center_dist)
 
-            if min_r <= orig_r <= max_r:
-                center_dist = np.hypot(orig_cx - w / 2.0, orig_cy - h / 2.0) / max(w, h)
-                score = circularity * (1.0 - 0.3 * center_dist)
-                if score > best_score:
-                    best_score = score
-                    best_circle = (orig_cx, orig_cy, orig_r)
+                    if score > best_score:
+                        # Refine circle fit using least-squares if contour has enough points
+                        if len(cnt) >= 10:
+                            pts_orig = (cnt.reshape(-1, 2).astype(np.float64)) / scale
+                            # Fast algebraic circle fit (Kåsa method)
+                            x = pts_orig[:, 0]
+                            y = pts_orig[:, 1]
+                            A = np.column_stack([x, y, np.ones_like(x)])
+                            b = x**2 + y**2
+                            try:
+                                c_fit, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+                                fit_cx = c_fit[0] / 2.0
+                                fit_cy = c_fit[1] / 2.0
+                                fit_r = np.sqrt(c_fit[2] + fit_cx**2 + fit_cy**2)
+                                if min_r <= fit_r <= max_r and np.hypot(fit_cx - orig_cx, fit_cy - orig_cy) < orig_r * 0.2:
+                                    orig_cx, orig_cy, orig_r = fit_cx, fit_cy, fit_r
+                            except Exception:
+                                pass
+
+                        best_score = score
+                        best_circle = (orig_cx, orig_cy, orig_r)
 
         if best_circle is not None:
             cx, cy, r = best_circle
@@ -114,9 +138,9 @@ class RobustCircleSegmenter(BaseApertureSegmenter):
                 image_height=h,
             )
 
-        # Strategy 2: Hough Circles fallback
+        # Strategy 2: Hough Circles Fallback
         dp = 1.2
-        min_dist = int(sh * 0.4)
+        min_dist = int(sh * 0.3)
         circles = cv2.HoughCircles(
             blurred,
             cv2.HOUGH_GRADIENT,
@@ -124,8 +148,8 @@ class RobustCircleSegmenter(BaseApertureSegmenter):
             minDist=min_dist,
             param1=50,
             param2=30,
-            minRadius=int(sh * 0.2),
-            maxRadius=int(sh * 0.8),
+            minRadius=int(sh * 0.25),
+            maxRadius=int(sh * 0.65),
         )
 
         if circles is not None and len(circles) > 0:
@@ -139,11 +163,11 @@ class RobustCircleSegmenter(BaseApertureSegmenter):
                 image_height=h,
             )
 
-        # Default fallback: centered circle inscribed in frame
+        # Fallback to centered inscribed optical circle
         return CircleAperture(
             center_x=w / 2.0,
             center_y=h / 2.0,
-            radius=min(w, h) * 0.45,
+            radius=min(w, h) * 0.46,
             image_width=w,
             image_height=h,
         )
