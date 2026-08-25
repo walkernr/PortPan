@@ -145,8 +145,8 @@ class CircleAperture(BaseModel):
 
         return (x1, y1, x2, y2)
 
-    def generate_mask(self, feather_px: float = 2.0) -> np.ndarray:
-        """Generate a 2D uint8 alpha mask (0-255) perfectly preserving the chromatic aberration ring with anti-aliasing."""
+    def generate_mask(self, feather_px: float = 2.0, image: np.ndarray | None = None) -> np.ndarray:
+        """Generate a 2D uint8 alpha mask (0-255) preserving the chromatic aberration ring with anti-aliasing."""
         import cv2
 
         mask = np.zeros((self.image_height, self.image_width), dtype=np.uint8)
@@ -163,13 +163,26 @@ class CircleAperture(BaseModel):
             ksize = int(round(feather_px * 2)) | 1  # ensure odd kernel size
             mask = cv2.GaussianBlur(mask, (ksize, ksize), feather_px / 2.0)
 
+        if image is not None:
+            # Luma-aware outer transparency: prevent dark bevel from obscuring overlapping details
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+            luma_alpha = np.clip((gray.astype(np.float32) - 20.0) / 35.0, 0.0, 1.0)
+
+            # Distance transform to apply luma fade only in the outer 12% rim zone
+            dist = cv2.distanceTransform((mask > 0).astype(np.uint8), cv2.DIST_L2, 5)
+            max_d = float(np.max(dist)) if np.max(dist) > 0 else 1.0
+            rim_factor = np.clip(1.0 - (dist / (max_d * 0.12 + 1e-5)), 0.0, 1.0)
+
+            mask_f = (mask.astype(np.float32) / 255.0) * (1.0 - rim_factor * (1.0 - luma_alpha))
+            mask = (np.clip(mask_f, 0.0, 1.0) * 255.0).astype(np.uint8)
+
         return mask
 
     def extract_rgba(self, image: np.ndarray, feather_px: float = 2.0) -> np.ndarray:
         """Extract a transparent 4-channel BGRA/RGBA porthole image retaining the full chromatic boundary."""
         import cv2
 
-        mask = self.generate_mask(feather_px=feather_px)
+        mask = self.generate_mask(feather_px=feather_px, image=image)
         bgra = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA) if len(image.shape) == 3 and image.shape[2] == 3 else image.copy()
         bgra[:, :, 3] = mask
         return bgra

@@ -173,10 +173,20 @@ class VisualAuditor:
         images_map: dict[str, np.ndarray],
         apertures_map: dict[str, CircleAperture],
         location_name: str,
+        canvas_scale: float = 2.0,
     ) -> Path:
-        """Render a composite preview warping all registered portholes onto the master canvas."""
-        composite = base_canvas.copy().astype(np.float32)
-        h_canvas, w_canvas = base_canvas.shape[:2]
+        """Render a composite preview warping all registered portholes onto the master canvas with super-resolution detail."""
+        h_orig, w_orig = base_canvas.shape[:2]
+
+        # Scale canvas up to super-resolution to retain full optical detail of digiscope telephoto shots
+        w_canvas = int(round(w_orig * canvas_scale))
+        h_canvas = int(round(h_orig * canvas_scale))
+        if canvas_scale != 1.0:
+            composite = cv2.resize(base_canvas, (w_canvas, h_canvas), interpolation=cv2.INTER_LANCZOS4).astype(np.float32)
+            S_mat = np.array([[canvas_scale, 0.0, 0.0], [0.0, canvas_scale, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        else:
+            composite = base_canvas.copy().astype(np.float32)
+            S_mat = np.eye(3, dtype=np.float64)
 
         for name, res in results.items():
             if res.status == "FAILED" or name not in images_map or name not in apertures_map:
@@ -185,9 +195,10 @@ class VisualAuditor:
             target_img = images_map[name]
             aperture = apertures_map[name]
             H_global = res.get_matrix_np()
+            H_scaled = S_mat @ H_global
 
-            # Generate exact chroma-preserving feathered mask
-            mask = aperture.generate_mask(feather_px=2.0).astype(np.float32) / 255.0
+            # Generate exact chroma-preserving feathered mask with luma modulation to prevent dark bevel blocking
+            mask = aperture.generate_mask(feather_px=2.0, image=target_img).astype(np.float32) / 255.0
 
             # Apply mask to target image
             masked_target = target_img.astype(np.float32) * mask[:, :, np.newaxis]
@@ -195,7 +206,7 @@ class VisualAuditor:
             # Warp masked target and mask into base canvas space
             warped_target = cv2.warpPerspective(
                 masked_target,
-                H_global,
+                H_scaled,
                 (w_canvas, h_canvas),
                 flags=cv2.INTER_LANCZOS4,
                 borderMode=cv2.BORDER_CONSTANT,
@@ -203,7 +214,7 @@ class VisualAuditor:
             )
             warped_mask = cv2.warpPerspective(
                 mask,
-                H_global,
+                H_scaled,
                 (w_canvas, h_canvas),
                 flags=cv2.INTER_LANCZOS4,
                 borderMode=cv2.BORDER_CONSTANT,
@@ -215,6 +226,18 @@ class VisualAuditor:
             composite = composite * (1.0 - m3) + warped_target * m3
 
         composite_uint8 = np.clip(composite, 0, 255).astype(np.uint8)
+
+        # Save main composite preview
         out_path = self.output_dir / f"{location_name}_composite_preview.jpg"
         cv2.imwrite(str(out_path), composite_uint8)
+
+        # Save 1:1 detail zoom crop if scaled
+        if canvas_scale > 1.0:
+            crop_x1 = int(w_canvas * 0.45)
+            crop_y1 = int(h_canvas * 0.40)
+            crop_x2 = int(w_canvas * 0.80)
+            crop_y2 = int(h_canvas * 0.75)
+            detail_crop = composite_uint8[crop_y1:crop_y2, crop_x1:crop_x2]
+            cv2.imwrite(str(self.output_dir / f"{location_name}_composite_detail_crop.jpg"), detail_crop)
+
         return out_path
