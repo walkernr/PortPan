@@ -55,5 +55,8 @@ Thumbs.db
 # Persistent Data
 /data/
 
+# Scratch Data
+/scratch/
+
 # Output Data
-/output
+/output/

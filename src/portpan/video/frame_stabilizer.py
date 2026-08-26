@@ -64,10 +64,19 @@ class VideoFrameStabilizer:
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
             track_mask = cv2.erode((mask_u8 > 128).astype(np.uint8) * 255, kernel)
 
-        # Convert frames to grayscale
-        gray_frames = [
-            cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) if len(f.shape) == 3 else f for f in frames
-        ]
+        # Convert frames to CV_8U grayscale
+        gray_frames: list[np.ndarray] = []
+        for f in frames:
+            if len(f.shape) == 3:
+                bgr = f[:, :, :3]
+                if bgr.dtype != np.uint8:
+                    bgr = np.clip(bgr, 0, 255).astype(np.uint8)
+                gray_frames.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY))
+            else:
+                g = f
+                if g.dtype != np.uint8:
+                    g = np.clip(g, 0, 255).astype(np.uint8)
+                gray_frames.append(g)
 
         # Detect good features to track on anchor frame
         anchor_gray = gray_frames[anchor_index]
@@ -233,6 +242,9 @@ class VideoFrameStabilizer:
 
         # Warp all frames to anchor coordinates using Lanczos4 interpolation
         stabilized_frames: list[np.ndarray] = []
+        is_bgra = frames[0].shape[2] == 4 if len(frames[0].shape) == 3 else False
+        border_val = (0, 0, 0, 0) if is_bgra else (0, 0, 0)
+
         for t, frame in enumerate(frames):
             H = transforms_to_anchor[t]
             if np.allclose(H, np.eye(3)):
@@ -244,7 +256,8 @@ class VideoFrameStabilizer:
                     M_2x3,
                     (w, h),
                     flags=cv2.INTER_LANCZOS4,
-                    borderMode=cv2.BORDER_REFLECT,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=border_val,
                 )
                 stabilized_frames.append(warped)
 

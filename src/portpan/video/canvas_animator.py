@@ -133,40 +133,41 @@ class CanvasVideoAnimator:
             # Scale aperture mask to video frame dimensions
             h_vid, w_vid = raw_frames[0].shape[:2]
             # Warp the high-resolution still aperture mask to video frame space
-            still_mask = aperture.generate_mask(feather_px=2.0, image=still_img).astype(np.float32) / 255.0
+            still_mask_u8 = aperture.generate_mask(feather_px=2.0)
             H_still_to_vid = np.linalg.inv(H_v2s)
-            vid_mask = cv2.warpPerspective(
-                still_mask,
+            vid_mask_u8 = cv2.warpPerspective(
+                still_mask_u8,
                 H_still_to_vid,
                 (w_vid, h_vid),
                 flags=cv2.INTER_LINEAR,
                 borderMode=cv2.BORDER_CONSTANT,
-                borderValue=0.0,
+                borderValue=0,
             )
+            vid_mask_f = vid_mask_u8.astype(np.float32) / 255.0
 
-            # Stabilize raw video frames to lock stationary optical features to the anchor keyframe
+            # Stabilize raw BGR video frames to lock stationary optical features to anchor keyframe
             logger.info(f"Stabilizing {len(raw_frames)} video frames for {img_name} to anchor keyframe...")
-            stabilized_frames = self.frame_stabilizer.stabilize_sequence(raw_frames, mask=vid_mask, anchor_index=0)
+            stabilized_bgr = self.frame_stabilizer.stabilize_sequence(raw_frames, mask=vid_mask_f, anchor_index=0)
 
-            # Synthesize seamlessly looping sequence from stabilized frames
-            loop_stream = self.loop_synthesizer.synthesize_loop(stabilized_frames, target_length=loop_frames)
+            # Synthesize seamlessly looping sequence from stabilized BGR frames
+            loop_stream_bgr = self.loop_synthesizer.synthesize_loop(stabilized_bgr, target_length=loop_frames)
 
-            # Pre-warp the static alpha mask into the master canvas coordinates
+            # Pre-warp the static optical aperture mask into the master canvas coordinates
             warped_canvas_mask = cv2.warpPerspective(
-                vid_mask,
+                vid_mask_f,
                 H_video_to_canvas,
                 (w_canvas, h_canvas),
                 flags=cv2.INTER_LANCZOS4,
                 borderMode=cv2.BORDER_CONSTANT,
                 borderValue=0.0,
             )
-            m3 = np.clip(warped_canvas_mask[:, :, np.newaxis], 0.0, 1.0)
+            warped_canvas_mask = np.clip(warped_canvas_mask, 0.0, 1.0)
+            m3 = warped_canvas_mask[:, :, np.newaxis]
 
             active_streams.append({
                 "name": img_name,
-                "frames": loop_stream,
+                "frames": loop_stream_bgr,
                 "H_video_to_canvas": H_video_to_canvas,
-                "vid_mask": vid_mask,
                 "warped_mask": m3,
                 "aperture": aperture,
             })
@@ -195,42 +196,22 @@ class CanvasVideoAnimator:
             frame_canvas = base_canvas_scaled.copy()
 
             for stream in active_streams:
-                vid_frame = stream["frames"][t]
+                bgr_frame = stream["frames"][t]
                 H_v2c = stream["H_video_to_canvas"]
-                vid_mask_base = stream["vid_mask"]  # geometric mask (no luma modulation)
+                warped_mask = stream["warped_mask"]
 
-                # Per-frame luma-aware mask: recompute from this frame's content
-                vid_frame_f32 = vid_frame.astype(np.float32)
-                luma_mask = CircleAperture.apply_luma_modulation(
-                    vid_mask_base.astype(np.float32), vid_frame
-                )
-
-                # Apply per-frame alpha mask to video frame
-                masked_frame = vid_frame_f32 * luma_mask[:, :, np.newaxis]
-
-                # Warp masked video frame into master canvas coordinates
-                warped_frame = cv2.warpPerspective(
-                    masked_frame,
+                # Warp stabilized BGR video frame directly into master canvas coordinates
+                warped_bgr = cv2.warpPerspective(
+                    bgr_frame,
                     H_v2c,
                     (w_canvas, h_canvas),
                     flags=cv2.INTER_LANCZOS4,
                     borderMode=cv2.BORDER_CONSTANT,
                     borderValue=(0, 0, 0),
-                )
+                ).astype(np.float32)
 
-                # Warp the per-frame alpha mask into canvas coordinates
-                warped_mask = cv2.warpPerspective(
-                    luma_mask,
-                    H_v2c,
-                    (w_canvas, h_canvas),
-                    flags=cv2.INTER_LINEAR,
-                    borderMode=cv2.BORDER_CONSTANT,
-                    borderValue=0.0,
-                )
-                m3 = np.clip(warped_mask[:, :, np.newaxis], 0.0, 1.0)
-
-                # Composite over master canvas
-                frame_canvas = frame_canvas * (1.0 - m3) + warped_frame * m3
+                # Composite over master canvas using Porter-Duff Over with static optical mask
+                frame_canvas = frame_canvas * (1.0 - warped_mask) + warped_bgr * warped_mask
 
             final_frame_uint8 = np.clip(frame_canvas, 0, 255).astype(np.uint8)
             writer.write(final_frame_uint8)

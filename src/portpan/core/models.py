@@ -147,17 +147,18 @@ class CircleAperture(BaseModel):
 
     @staticmethod
     def apply_luma_modulation(
-        mask: np.ndarray, image: np.ndarray, rim_fraction: float = 0.12
+        mask: np.ndarray, image: np.ndarray, rim_fraction: float = 0.15
     ) -> np.ndarray:
-        """Apply luma-aware transparency modulation to an alpha mask.
+        """Apply adaptive chroma- and luma-aware transparency modulation to an alpha mask.
 
         Fades dark bevel regions to transparent in the outer rim zone so they
-        don't occlude overlapping porthole detail. Works on both uint8 (0-255)
+        don't occlude overlapping porthole detail, while keeping the vibrant
+        blue/cyan chromatic fringe fully opaque. Works on both uint8 (0-255)
         and float32 (0.0-1.0) masks.
 
         Args:
             mask: 2D alpha mask (uint8 0-255 or float32 0.0-1.0).
-            image: BGR source image for luma extraction.
+            image: BGR source image for luma and chromaticity extraction.
             rim_fraction: Fraction of mask radius defining the outer rim zone.
 
         Returns:
@@ -171,15 +172,43 @@ class CircleAperture(BaseModel):
         else:
             mask_u8 = mask
 
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-        luma_alpha = np.clip((gray.astype(np.float32) - 20.0) / 35.0, 0.0, 1.0)
+        if len(image.shape) == 3 and image.shape[2] == 3:
+            b = image[:, :, 0].astype(np.float32)
+            g = image[:, :, 1].astype(np.float32)
+            r = image[:, :, 2].astype(np.float32)
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            # Blue chromatic excess indicates the true optical boundary fringe
+            blue_excess = b - 0.5 * (r + g)
+        else:
+            gray = image
+            blue_excess = np.zeros_like(gray, dtype=np.float32)
 
-        # Distance transform to apply luma fade only in the outer rim zone
+        # Distance transform to apply modulation in the outer rim zone
         dist = cv2.distanceTransform((mask_u8 > 0).astype(np.uint8), cv2.DIST_L2, 5)
         max_d = float(np.max(dist)) if np.max(dist) > 0 else 1.0
+
+        # Interior reference luminance (median of central aperture core)
+        interior_mask = dist > (max_d * 0.35)
+        if np.any(interior_mask):
+            luma_ref = float(np.median(gray[interior_mask]))
+        else:
+            luma_ref = 120.0
+
+        # Rim factor: 0.0 at inner rim boundary, 1.0 at outer mask perimeter
         rim_factor = np.clip(1.0 - (dist / (max_d * rim_fraction + 1e-5)), 0.0, 1.0)
 
-        mask_f = (mask_u8.astype(np.float32) / 255.0) * (1.0 - rim_factor * (1.0 - luma_alpha))
+        # Chromatic boost preserves the cyan/blue dispersion ring
+        chroma_boost = np.clip((blue_excess - 5.0) / 25.0, 0.0, 1.0)
+
+        # Dark bevel falloff: dark eyecup plastic (gray 20-75) fades to 0
+        luma_thresh_high = max(55.0, luma_ref * 0.50)
+        luma_thresh_low = 22.0
+        luma_alpha = np.clip((gray.astype(np.float32) - luma_thresh_low) / (luma_thresh_high - luma_thresh_low + 1e-5), 0.0, 1.0)
+
+        # Effective alpha in rim: opaque if bright OR if chromatic blue ring
+        effective_alpha = np.maximum(chroma_boost, luma_alpha)
+
+        mask_f = (mask_u8.astype(np.float32) / 255.0) * (1.0 - rim_factor * (1.0 - effective_alpha))
 
         if is_float:
             return np.clip(mask_f, 0.0, 1.0).astype(np.float32)
@@ -202,9 +231,6 @@ class CircleAperture(BaseModel):
         if feather_px > 0:
             ksize = int(round(feather_px * 2)) | 1  # ensure odd kernel size
             mask = cv2.GaussianBlur(mask, (ksize, ksize), feather_px / 2.0)
-
-        if image is not None:
-            mask = CircleAperture.apply_luma_modulation(mask, image)
 
         return mask
 
