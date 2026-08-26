@@ -130,19 +130,9 @@ class CanvasVideoAnimator:
             # Full composite matrix mapping video pixel space -> master canvas space
             H_video_to_canvas = S_canvas @ H_global @ H_v2s
 
-            # Scale aperture mask to video frame dimensions
-            h_vid, w_vid = raw_frames[0].shape[:2]
-            # Warp the high-resolution still aperture mask to video frame space
-            still_mask_u8 = aperture.generate_mask(feather_px=2.0)
-            H_still_to_vid = np.linalg.inv(H_v2s)
-            vid_mask_u8 = cv2.warpPerspective(
-                still_mask_u8,
-                H_still_to_vid,
-                (w_vid, h_vid),
-                flags=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_CONSTANT,
-                borderValue=0,
-            )
+            # Detect optical aperture directly on the video keyframe for pixel-perfect mask alignment
+            vid_aperture = self.segmenter.segment(raw_frames[0])
+            vid_mask_u8 = vid_aperture.generate_mask(feather_px=2.0)
             vid_mask_f = vid_mask_u8.astype(np.float32) / 255.0
 
             # Stabilize raw BGR video frames to lock stationary optical features to anchor keyframe
@@ -152,31 +142,50 @@ class CanvasVideoAnimator:
             # Synthesize seamlessly looping sequence from stabilized BGR frames
             loop_stream_bgr = self.loop_synthesizer.synthesize_loop(stabilized_bgr, target_length=loop_frames)
 
-            # Pre-warp the static optical aperture mask into the master canvas coordinates
-            warped_canvas_mask = cv2.warpPerspective(
-                vid_mask_f,
-                H_video_to_canvas,
-                (w_canvas, h_canvas),
-                flags=cv2.INTER_LANCZOS4,
-                borderMode=cv2.BORDER_CONSTANT,
-                borderValue=0.0,
-            )
-            warped_canvas_mask = np.clip(warped_canvas_mask, 0.0, 1.0)
-            m3 = warped_canvas_mask[:, :, np.newaxis]
+            # Precompute per-frame dynamic aperture masks with soft boundary feathering
+            logger.info(f"Computing frame-wise dynamic aperture masks for {img_name} ({loop_frames} frames)...")
+            warped_canvas_masks: list[np.ndarray] = []
+            for t_idx, f in enumerate(loop_stream_bgr):
+                ap_t = self.segmenter.segment(f)
+                
+                # Valid illumination gating (eliminates any black warp/stabilization borders)
+                g_f = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+                b_f, _, r_f = cv2.split(f.astype(np.float32))
+                valid_f = ((g_f > 35) & (r_f - b_f < 12.0)).astype(np.float32)
+                valid_f = cv2.erode(valid_f, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+                
+                mask_t = np.zeros(f.shape[:2], dtype=np.float32)
+                r_draw = max(1.0, ap_t.radius - 2.0)
+                cv2.circle(mask_t, (int(round(ap_t.center_x)), int(round(ap_t.center_y))), int(round(r_draw)), 1.0, -1)
+                mask_t = mask_t * valid_f
+                # Soft cosine / Gaussian feather at dispersion boundary
+                mask_t = cv2.GaussianBlur(mask_t, (21, 21), 6.0)
+                
+                # Warp to master canvas
+                w_mask = cv2.warpPerspective(
+                    mask_t,
+                    H_video_to_canvas,
+                    (w_canvas, h_canvas),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0.0,
+                )
+                w_mask = np.clip(w_mask, 0.0, 1.0)[:, :, np.newaxis]
+                warped_canvas_masks.append(w_mask)
 
             active_streams.append({
                 "name": img_name,
                 "frames": loop_stream_bgr,
                 "H_video_to_canvas": H_video_to_canvas,
-                "warped_mask": m3,
-                "aperture": aperture,
+                "warped_masks": warped_canvas_masks,
+                "footprint_area": float(np.sum(warped_canvas_masks[0])),
             })
 
         if not active_streams:
             raise PortPanError(f"No valid video streams could be prepared for location: {loc_name}")
 
         # Sort by warped footprint area descending: largest (most zoomed-out) behind, smallest on top
-        active_streams.sort(key=lambda s: float(np.sum(s["warped_mask"])), reverse=True)
+        active_streams.sort(key=lambda s: s["footprint_area"], reverse=True)
         logger.info(f"Z-order (back→front): {[s['name'] for s in active_streams]}")
 
         logger.info(f"Rendering {loop_frames} synchronized frames with {len(active_streams)} active portholes...")
@@ -198,7 +207,7 @@ class CanvasVideoAnimator:
             for stream in active_streams:
                 bgr_frame = stream["frames"][t]
                 H_v2c = stream["H_video_to_canvas"]
-                warped_mask = stream["warped_mask"]
+                warped_mask = stream["warped_masks"][t]
 
                 # Warp stabilized BGR video frame directly into master canvas coordinates
                 warped_bgr = cv2.warpPerspective(
@@ -210,7 +219,7 @@ class CanvasVideoAnimator:
                     borderValue=(0, 0, 0),
                 ).astype(np.float32)
 
-                # Composite over master canvas using Porter-Duff Over with static optical mask
+                # Composite over master canvas using Porter-Duff Over with dynamic optical mask
                 frame_canvas = frame_canvas * (1.0 - warped_mask) + warped_bgr * warped_mask
 
             final_frame_uint8 = np.clip(frame_canvas, 0, 255).astype(np.uint8)
