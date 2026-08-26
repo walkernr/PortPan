@@ -94,5 +94,38 @@ def status(
     console.print(table)
 
 
+@app.command()
+def animate(
+    location_name: str = typer.Argument(..., help="Name of location folder under data/locations/"),
+    data_dir: Path = typer.Option(Path("data/locations"), help="Path to locations directory"),
+    output_video: Path | None = typer.Option(None, help="Custom output video path"),
+    loop_frames: int = typer.Option(60, help="Number of frames in the seamless loop"),
+    fps: float = typer.Option(30.0, help="Frames per second of the output video"),
+    canvas_scale: float = typer.Option(1.5, help="Canvas super-resolution scaling factor (e.g. 1.0, 1.5, 2.0)"),
+) -> None:
+    """Synthesize a synchronized, seamlessly looping master video with animated portholes over the base panorama."""
+    from portpan.video.canvas_animator import CanvasVideoAnimator
+
+    loc_dir = data_dir / location_name
+    if not loc_dir.exists():
+        console.print(f"[red]Error:[/red] Location directory not found: {loc_dir}")
+        raise typer.Exit(1)
+
+    out_path = output_video or (Path("output") / location_name / f"{location_name}_animated_loop.mp4")
+    console.print(f"[bold cyan]Synthesizing animated canvas video for:[/bold cyan] {location_name}")
+    console.print(f"Canvas scale: [bold]{canvas_scale}x[/bold], Loop length: [bold]{loop_frames} frames[/bold] @ [bold]{fps} fps[/bold]")
+
+    animator = CanvasVideoAnimator()
+    exported_path = animator.animate_location(
+        location_dir=loc_dir,
+        output_path=out_path,
+        loop_frames=loop_frames,
+        fps=fps,
+        canvas_scale=canvas_scale,
+    )
+
+    console.print(f"[bold green]Successfully generated animated video:[/bold green] {exported_path}")
+
+
 if __name__ == "__main__":
     app()

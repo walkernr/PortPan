@@ -145,6 +145,46 @@ class CircleAperture(BaseModel):
 
         return (x1, y1, x2, y2)
 
+    @staticmethod
+    def apply_luma_modulation(
+        mask: np.ndarray, image: np.ndarray, rim_fraction: float = 0.12
+    ) -> np.ndarray:
+        """Apply luma-aware transparency modulation to an alpha mask.
+
+        Fades dark bevel regions to transparent in the outer rim zone so they
+        don't occlude overlapping porthole detail. Works on both uint8 (0-255)
+        and float32 (0.0-1.0) masks.
+
+        Args:
+            mask: 2D alpha mask (uint8 0-255 or float32 0.0-1.0).
+            image: BGR source image for luma extraction.
+            rim_fraction: Fraction of mask radius defining the outer rim zone.
+
+        Returns:
+            Modulated mask in the same dtype as input.
+        """
+        import cv2
+
+        is_float = mask.dtype == np.float32
+        if is_float:
+            mask_u8 = (np.clip(mask, 0.0, 1.0) * 255.0).astype(np.uint8)
+        else:
+            mask_u8 = mask
+
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        luma_alpha = np.clip((gray.astype(np.float32) - 20.0) / 35.0, 0.0, 1.0)
+
+        # Distance transform to apply luma fade only in the outer rim zone
+        dist = cv2.distanceTransform((mask_u8 > 0).astype(np.uint8), cv2.DIST_L2, 5)
+        max_d = float(np.max(dist)) if np.max(dist) > 0 else 1.0
+        rim_factor = np.clip(1.0 - (dist / (max_d * rim_fraction + 1e-5)), 0.0, 1.0)
+
+        mask_f = (mask_u8.astype(np.float32) / 255.0) * (1.0 - rim_factor * (1.0 - luma_alpha))
+
+        if is_float:
+            return np.clip(mask_f, 0.0, 1.0).astype(np.float32)
+        return (np.clip(mask_f, 0.0, 1.0) * 255.0).astype(np.uint8)
+
     def generate_mask(self, feather_px: float = 2.0, image: np.ndarray | None = None) -> np.ndarray:
         """Generate a 2D uint8 alpha mask (0-255) preserving the chromatic aberration ring with anti-aliasing."""
         import cv2
@@ -164,17 +204,7 @@ class CircleAperture(BaseModel):
             mask = cv2.GaussianBlur(mask, (ksize, ksize), feather_px / 2.0)
 
         if image is not None:
-            # Luma-aware outer transparency: prevent dark bevel from obscuring overlapping details
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-            luma_alpha = np.clip((gray.astype(np.float32) - 20.0) / 35.0, 0.0, 1.0)
-
-            # Distance transform to apply luma fade only in the outer 12% rim zone
-            dist = cv2.distanceTransform((mask > 0).astype(np.uint8), cv2.DIST_L2, 5)
-            max_d = float(np.max(dist)) if np.max(dist) > 0 else 1.0
-            rim_factor = np.clip(1.0 - (dist / (max_d * 0.12 + 1e-5)), 0.0, 1.0)
-
-            mask_f = (mask.astype(np.float32) / 255.0) * (1.0 - rim_factor * (1.0 - luma_alpha))
-            mask = (np.clip(mask_f, 0.0, 1.0) * 255.0).astype(np.uint8)
+            mask = CircleAperture.apply_luma_modulation(mask, image)
 
         return mask
 

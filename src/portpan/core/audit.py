@@ -188,6 +188,9 @@ class VisualAuditor:
             composite = base_canvas.copy().astype(np.float32)
             S_mat = np.eye(3, dtype=np.float64)
 
+        portholes: list[dict[str, Any]] = []
+        total_mask = np.zeros((h_canvas, w_canvas), dtype=np.float32)
+
         for name, res in results.items():
             if res.status == "FAILED" or name not in images_map or name not in apertures_map:
                 continue
@@ -221,9 +224,22 @@ class VisualAuditor:
                 borderValue=0.0,
             )
 
-            # Alpha blend into master canvas
-            m3 = np.clip(warped_mask[:, :, np.newaxis], 0.0, 1.0)
-            composite = composite * (1.0 - m3) + warped_target * m3
+            total_mask = np.maximum(total_mask, warped_mask)
+            footprint_area = float(np.sum(warped_mask > 0.05))
+
+            portholes.append({
+                "name": name,
+                "warped_target": warped_target,
+                "warped_mask": warped_mask,
+                "area": footprint_area,
+            })
+
+        # Z-sort: largest footprint first (background), smallest/highest zoom on top
+        portholes.sort(key=lambda p: p["area"], reverse=True)
+
+        for p in portholes:
+            m3 = np.clip(p["warped_mask"][:, :, np.newaxis], 0.0, 1.0)
+            composite = composite * (1.0 - m3) + p["warped_target"] * m3
 
         composite_uint8 = np.clip(composite, 0, 255).astype(np.uint8)
 
@@ -231,12 +247,21 @@ class VisualAuditor:
         out_path = self.output_dir / f"{location_name}_composite_preview.jpg"
         cv2.imwrite(str(out_path), composite_uint8)
 
-        # Save 1:1 detail zoom crop if scaled
-        if canvas_scale > 1.0:
-            crop_x1 = int(w_canvas * 0.45)
-            crop_y1 = int(h_canvas * 0.40)
-            crop_x2 = int(w_canvas * 0.80)
-            crop_y2 = int(h_canvas * 0.75)
+        # Save dynamic detail crop encapsulating all matched aperture projections with padding
+        active_coords = np.where(total_mask > 0.01)
+        if len(active_coords[0]) > 0:
+            min_y, max_y = int(np.min(active_coords[0])), int(np.max(active_coords[0]))
+            min_x, max_x = int(np.min(active_coords[1])), int(np.max(active_coords[1]))
+
+            # Add 8% padding margin around the bounding box (at least 20px)
+            pad_x = max(20, int((max_x - min_x) * 0.08))
+            pad_y = max(20, int((max_y - min_y) * 0.08))
+
+            crop_x1 = max(0, min_x - pad_x)
+            crop_y1 = max(0, min_y - pad_y)
+            crop_x2 = min(w_canvas, max_x + pad_x)
+            crop_y2 = min(h_canvas, max_y + pad_y)
+
             detail_crop = composite_uint8[crop_y1:crop_y2, crop_x1:crop_x2]
             cv2.imwrite(str(self.output_dir / f"{location_name}_composite_detail_crop.jpg"), detail_crop)
 
