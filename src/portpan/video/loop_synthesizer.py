@@ -54,22 +54,84 @@ class SeamlessLoopSynthesizer:
             indices = np.linspace(0, num_input - 1, target_length).astype(np.int32)
             return [frames[i] for i in indices]
 
-        # Base sequence of length target_length
-        raw_indices = np.linspace(0, num_input - 1, target_length + xfade_len).astype(np.int32)
-        sampled_frames = [frames[i] for i in raw_indices]
+        # Base sequence of length target_length with smooth temporal interpolation
+        raw_times = np.linspace(0, num_input - 1, target_length + xfade_len)
+        sampled_frames: list[np.ndarray] = []
+        for t_val in raw_times:
+            idx0 = int(np.floor(t_val))
+            idx1 = min(idx0 + 1, num_input - 1)
+            frac = float(t_val - idx0)
+            if frac < 1e-4 or idx0 == idx1:
+                sampled_frames.append(frames[idx0])
+            else:
+                f0 = frames[idx0].astype(np.float32)
+                f1 = frames[idx1].astype(np.float32)
+                sampled_frames.append((f0 * (1.0 - frac) + f1 * frac).astype(np.uint8))
 
         # Output buffer
         loop_frames: list[np.ndarray] = []
 
         for t in range(target_length):
-            if t < xfade_len:
-                # In the transition region: blend head (t) and tail (target_length + t)
-                alpha = float(t) / float(xfade_len)
-                head_f = sampled_frames[t].astype(np.float32)
-                tail_f = sampled_frames[target_length + t].astype(np.float32)
-                blended = (head_f * alpha + tail_f * (1.0 - alpha)).astype(np.uint8)
-                loop_frames.append(blended)
-            else:
-                loop_frames.append(sampled_frames[t])
+            loop_frames.append(self.synthesize_frame(frames, t, target_length=target_length))
 
         return loop_frames
+
+    def synthesize_frame(self, frames: list[np.ndarray], t: int, target_length: int = 60) -> np.ndarray:
+        """Generate a single synthesized frame at index `t` on the fly with zero memory overhead.
+
+        Args:
+            frames: Input list of BGR video frames.
+            t: Frame index in range [0, target_length - 1].
+            target_length: Total frames in the looping sequence.
+
+        Returns:
+            Synthesized BGR frame at time `t`.
+        """
+        if not frames:
+            raise ValueError("Input frames list is empty")
+
+        num_input = len(frames)
+
+        if self.mode == LoopMode.PING_PONG:
+            forward = frames
+            backward = frames[-2:0:-1] if len(frames) > 2 else []
+            full_cycle = forward + backward
+            if not full_cycle:
+                full_cycle = frames
+            raw_time = t * (len(full_cycle) - 1) / max(1, target_length - 1)
+            idx0 = int(np.floor(raw_time))
+            idx1 = min(idx0 + 1, len(full_cycle) - 1)
+            frac = float(raw_time - idx0)
+            if frac < 1e-4 or idx0 == idx1:
+                return full_cycle[idx0]
+            return (full_cycle[idx0].astype(np.float32) * (1.0 - frac) + full_cycle[idx1].astype(np.float32) * frac).astype(np.uint8)
+
+        # Crossfade mode
+        xfade_len = min(self.crossfade_frames, num_input // 3, target_length // 3)
+        if xfade_len < 2:
+            raw_time = t * (num_input - 1) / max(1, target_length - 1)
+            idx0 = int(np.floor(raw_time))
+            idx1 = min(idx0 + 1, num_input - 1)
+            frac = float(raw_time - idx0)
+            if frac < 1e-4 or idx0 == idx1:
+                return frames[idx0]
+            return (frames[idx0].astype(np.float32) * (1.0 - frac) + frames[idx1].astype(np.float32) * frac).astype(np.uint8)
+
+        # Helper to sample at time slot k in [0, target_length + xfade_len - 1]
+        total_slots = target_length + xfade_len - 1
+        def sample_slot(k: int) -> np.ndarray:
+            r_t = k * (num_input - 1) / max(1, total_slots)
+            i0 = int(np.floor(r_t))
+            i1 = min(i0 + 1, num_input - 1)
+            fr = float(r_t - i0)
+            if fr < 1e-4 or i0 == i1:
+                return frames[i0]
+            return (frames[i0].astype(np.float32) * (1.0 - fr) + frames[i1].astype(np.float32) * fr).astype(np.uint8)
+
+        if t < xfade_len:
+            alpha = float(t) / float(xfade_len)
+            head_f = sample_slot(t).astype(np.float32)
+            tail_f = sample_slot(target_length + t).astype(np.float32)
+            return (head_f * alpha + tail_f * (1.0 - alpha)).astype(np.uint8)
+
+        return sample_slot(t)
