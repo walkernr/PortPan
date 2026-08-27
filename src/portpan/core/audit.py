@@ -173,12 +173,11 @@ class VisualAuditor:
         images_map: dict[str, np.ndarray],
         apertures_map: dict[str, CircleAperture],
         location_name: str,
-        canvas_scale: float = 2.0,
+        canvas_scale: float = 1.0,
     ) -> Path:
         """Render a composite preview warping all registered portholes onto the master canvas with super-resolution detail."""
         h_orig, w_orig = base_canvas.shape[:2]
 
-        # Scale canvas up to super-resolution to retain full optical detail of digiscope telephoto shots
         w_canvas = int(round(w_orig * canvas_scale))
         h_canvas = int(round(h_orig * canvas_scale))
         if canvas_scale != 1.0:
@@ -188,58 +187,78 @@ class VisualAuditor:
             composite = base_canvas.copy().astype(np.float32)
             S_mat = np.eye(3, dtype=np.float64)
 
-        portholes: list[dict[str, Any]] = []
-        total_mask = np.zeros((h_canvas, w_canvas), dtype=np.float32)
-
+        # 1. Pre-calculate Z-order without allocating warped full-canvas buffers
+        entries: list[dict[str, Any]] = []
         for name, res in results.items():
             if res.status == "FAILED" or name not in images_map or name not in apertures_map:
                 continue
 
-            target_img = images_map[name]
             aperture = apertures_map[name]
             H_global = res.get_matrix_np()
             H_scaled = S_mat @ H_global
 
-            # Generate exact chroma-preserving feathered mask with luma modulation to prevent dark bevel blocking
-            mask = aperture.generate_mask(feather_px=2.0, image=target_img).astype(np.float32) / 255.0
+            # Footprint area on canvas
+            r_canvas = aperture.radius * np.sqrt(H_scaled[0, 0] ** 2 + H_scaled[0, 1] ** 2)
+            footprint_area = np.pi * (r_canvas ** 2)
 
-            # Apply mask to target image
-            masked_target = target_img.astype(np.float32) * mask[:, :, np.newaxis]
+            entries.append({
+                "name": name,
+                "H_scaled": H_scaled,
+                "aperture": aperture,
+                "area": footprint_area,
+            })
 
-            # Warp masked target and mask into base canvas space
-            warped_target = cv2.warpPerspective(
-                masked_target,
+        # Z-sort: largest footprint first (background), smallest/highest zoom on top
+        entries.sort(key=lambda p: p["area"], reverse=True)
+
+        total_mask = np.zeros((h_canvas, w_canvas), dtype=np.float32)
+
+        # 2. Warp and blend in-place one porthole at a time with ROI bounding boxes
+        for entry in entries:
+            name = entry["name"]
+            target_img = images_map[name]
+            aperture = entry["aperture"]
+            H_scaled = entry["H_scaled"]
+
+            # Native smooth feathered aperture mask (12px feathering)
+            h_t, w_t = target_img.shape[:2]
+            Y_t, X_t = np.ogrid[:h_t, :w_t]
+            d_t = np.sqrt((X_t - aperture.center_x) ** 2 + (Y_t - aperture.center_y) ** 2)
+            mask_native = np.clip((aperture.radius - d_t) / 12.0, 0.0, 1.0).astype(np.float32)
+
+            # Warp mask and target to canvas
+            w_mask = cv2.warpPerspective(
+                mask_native,
+                H_scaled,
+                (w_canvas, h_canvas),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0.0,
+            )
+            w_target = cv2.warpPerspective(
+                target_img,
                 H_scaled,
                 (w_canvas, h_canvas),
                 flags=cv2.INTER_LANCZOS4,
                 borderMode=cv2.BORDER_CONSTANT,
                 borderValue=(0, 0, 0),
             )
-            warped_mask = cv2.warpPerspective(
-                mask,
-                H_scaled,
-                (w_canvas, h_canvas),
-                flags=cv2.INTER_LANCZOS4,
-                borderMode=cv2.BORDER_CONSTANT,
-                borderValue=0.0,
-            )
 
-            total_mask = np.maximum(total_mask, warped_mask)
-            footprint_area = float(np.sum(warped_mask > 0.05))
+            total_mask = np.maximum(total_mask, w_mask)
 
-            portholes.append({
-                "name": name,
-                "warped_target": warped_target,
-                "warped_mask": warped_mask,
-                "area": footprint_area,
-            })
+            # Blend strictly within active ROI bounding box
+            nz_rows, nz_cols = np.where(w_mask > 0.001)
+            if len(nz_rows) > 0:
+                ymin, ymax = int(np.min(nz_rows)), int(np.max(nz_rows)) + 1
+                xmin, xmax = int(np.min(nz_cols)), int(np.max(nz_cols)) + 1
 
-        # Z-sort: largest footprint first (background), smallest/highest zoom on top
-        portholes.sort(key=lambda p: p["area"], reverse=True)
+                m_roi = w_mask[ymin:ymax, xmin:xmax, np.newaxis]
+                c_roi = composite[ymin:ymax, xmin:xmax]
+                b_roi = w_target[ymin:ymax, xmin:xmax].astype(np.float32)
 
-        for p in portholes:
-            m3 = np.clip(p["warped_mask"][:, :, np.newaxis], 0.0, 1.0)
-            composite = composite * (1.0 - m3) + p["warped_target"] * m3
+                composite[ymin:ymax, xmin:xmax] = c_roi * (1.0 - m_roi) + b_roi * m_roi
+
+            del w_mask, w_target
 
         composite_uint8 = np.clip(composite, 0, 255).astype(np.uint8)
 

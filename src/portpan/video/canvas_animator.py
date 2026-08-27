@@ -161,18 +161,19 @@ class CanvasVideoAnimator:
         video_files = list(videos_dir.glob("*.mp4")) + list(videos_dir.glob("*.mov"))
         logger.info(f"Found {len(video_files)} video streams in {videos_dir}")
 
+        import tempfile
+        import gc
+        temp_dir = tempfile.TemporaryDirectory()
+        temp_p = Path(temp_dir.name)
+
         active_streams: list[dict[str, Any]] = []
 
-        for img_name, res in loc_transforms.transforms.items():
+        for stream_idx, (img_name, res) in enumerate(loc_transforms.transforms.items()):
             if res.status == "FAILED" or res.transform_matrix is None:
                 continue
 
             img_path = images_dir / img_name
             if not img_path.exists():
-                continue
-
-            still_img = cv2.imread(str(img_path))
-            if still_img is None:
                 continue
 
             H_global = res.get_matrix_np()
@@ -185,7 +186,9 @@ class CanvasVideoAnimator:
                 if res.video_to_still_transform is not None:
                     H_v2s = res.get_video_matrix_np()
                 else:
+                    still_img = cv2.imread(str(img_path))
                     H_v2s = self.offset_estimator.estimate_offset(still_img, matched_video)
+                    del still_img
 
                 H_video_to_canvas = S_canvas @ H_global @ H_v2s
 
@@ -206,36 +209,34 @@ class CanvasVideoAnimator:
                 # Footprint area on canvas for z-ordering
                 footprint_area = np.pi * ((r_v * np.sqrt(H_video_to_canvas[0, 0] ** 2 + H_video_to_canvas[0, 1] ** 2)) ** 2)
 
+                # Cache stabilized video frames to temp MP4 to maintain low RAM
+                temp_video_path = temp_p / f"stream_{stream_idx}.mp4"
+                v_h, v_w = stabilized_bgr[0].shape[:2]
+                writer_temp = cv2.VideoWriter(str(temp_video_path), cv2.VideoWriter.fourcc(*"mp4v"), fps, (v_w, v_h))
+                for sf in stabilized_bgr:
+                    writer_temp.write(sf)
+                writer_temp.release()
+
+                del raw_frames, stabilized_bgr
+                gc.collect()
+
                 active_streams.append({
                     "name": img_name,
                     "is_video": True,
-                    "frames": stabilized_bgr,
+                    "video_path": temp_video_path,
                     "H_canvas": H_video_to_canvas,
                     "mask_native": mask_native,
                     "footprint_area": float(footprint_area),
                 })
 
             else:
-                # Check if this still image is a duplicate of an existing video stream (distance < 120px on canvas)
-                H_still_to_canvas = S_canvas @ H_global
-                pt_can = H_still_to_canvas @ np.array([still_img.shape[1] / 2.0, still_img.shape[0] / 2.0, 1.0])
-                pt_can /= pt_can[2]
-
-                is_duplicate = False
-                for vs in active_streams:
-                    if vs["is_video"]:
-                        vs_c = vs["H_canvas"] @ np.array([vs["frames"][0].shape[1] / 2.0, vs["frames"][0].shape[0] / 2.0, 1.0])
-                        vs_c /= vs_c[2]
-                        if float(np.hypot(pt_can[0] - vs_c[0], pt_can[1] - vs_c[1])) < 120.0:
-                            is_duplicate = True
-                            break
-
-                if is_duplicate:
-                    logger.info(f"Skipping static duplicate {img_name} (active video stream already covers this location)")
+                # Static still-image porthole with clean inscribed optical aperture and smooth 12px feathering
+                logger.info(f"Preparing static porthole stream for still image: {img_name}")
+                still_img = cv2.imread(str(img_path))
+                if still_img is None:
                     continue
 
-                # Static still-image porthole fallback with clean inscribed optical aperture
-                logger.info(f"Preparing static porthole stream for still image: {img_name}")
+                H_still_to_canvas = S_canvas @ H_global
                 cx_s, cy_s, r_s = self._detect_video_aperture(still_img)
                 Y_s, X_s = np.ogrid[: still_img.shape[0], : still_img.shape[1]]
                 d_from_center_s = np.sqrt((X_s - cx_s) ** 2 + (Y_s - cy_s) ** 2)
@@ -253,13 +254,28 @@ class CanvasVideoAnimator:
                 })
 
         if not active_streams:
+            temp_dir.cleanup()
             raise PortPanError(f"No valid streams could be prepared for location: {loc_name}")
 
         # Sort by footprint area descending: largest (zoomed out) behind, smallest/highest-zoom on top
         active_streams.sort(key=lambda s: s["footprint_area"], reverse=True)
         logger.info(f"Z-order (back→front): {[s['name'] for s in active_streams]}")
 
-        logger.info(f"Rendering {loop_frames} synchronized frames with {len(active_streams)} active portholes (low-RAM streaming mode)...")
+        logger.info(f"Rendering {loop_frames} synchronized frames with {len(active_streams)} active portholes (bounded low-RAM streaming mode)...")
+
+        # Open video capture handles for all video streams
+        video_caps: dict[str, list[np.ndarray]] = {}
+        for s in active_streams:
+            if s["is_video"]:
+                cap = cv2.VideoCapture(str(s["video_path"]))
+                frames_list = []
+                while True:
+                    ret, fr = cap.read()
+                    if not ret:
+                        break
+                    frames_list.append(fr)
+                cap.release()
+                video_caps[s["name"]] = frames_list
 
         # 4. Stream frame-by-frame directly to FFmpeg H.264 pipe
         out_p = Path(output_path)
@@ -294,14 +310,13 @@ class CanvasVideoAnimator:
             fourcc = cv2.VideoWriter.fourcc(*"mp4v")
             writer = cv2.VideoWriter(str(out_p), fourcc, fps, (w_canvas, h_canvas))
 
-        erode_kernel = np.ones((5, 5), np.uint8)
-
         for t in range(loop_frames):
             frame_canvas = base_canvas_scaled.copy().astype(np.uint8)
 
             for stream in active_streams:
                 if stream["is_video"]:
-                    bgr_frame = self.loop_synthesizer.synthesize_frame(stream["frames"], t, target_length=loop_frames)
+                    st_frames = video_caps[stream["name"]]
+                    bgr_frame = self.loop_synthesizer.synthesize_frame(st_frames, t, target_length=loop_frames)
                 else:
                     bgr_frame = stream["image"]
 
@@ -351,5 +366,6 @@ class CanvasVideoAnimator:
         elif writer is not None:
             writer.release()
 
+        temp_dir.cleanup()
         logger.info(f"Successfully exported animated canvas video: {out_p}")
         return out_p
