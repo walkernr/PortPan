@@ -232,6 +232,9 @@ class CircleAperture(BaseModel):
             ksize = int(round(feather_px * 2)) | 1  # ensure odd kernel size
             mask = cv2.GaussianBlur(mask, (ksize, ksize), feather_px / 2.0)
 
+        if image is not None:
+            mask = CircleAperture.apply_luma_modulation(mask, image)
+
         return mask
 
     def extract_rgba(self, image: np.ndarray, feather_px: float = 2.0) -> np.ndarray:

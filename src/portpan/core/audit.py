@@ -131,11 +131,12 @@ class VisualAuditor:
         font_scale = max(0.5, w * 0.0004)
 
         for name, res in results.items():
-            if res.bounding_box_in_base is None or res.status == "FAILED":
+            status_val = res.status.value if hasattr(res.status, "value") else str(res.status)
+            if res.bounding_box_in_base is None or status_val == "FAILED":
                 continue
 
             pts = np.array(res.bounding_box_in_base, dtype=np.int32).reshape((-1, 1, 2))
-            color = (0, 255, 0) if res.status == "SUCCESS" else (0, 200, 255)
+            color = (0, 255, 0) if status_val == "SUCCESS" else (0, 200, 255)
 
             cv2.polylines(overview, [pts], isClosed=True, color=color, thickness=line_thick, lineType=cv2.LINE_AA)
 
@@ -187,44 +188,57 @@ class VisualAuditor:
             composite = base_canvas.copy().astype(np.float32)
             S_mat = np.eye(3, dtype=np.float64)
 
-        # 1. Pre-calculate Z-order without allocating warped full-canvas buffers
-        entries: list[dict[str, Any]] = []
+        # 1. Gather all registered portholes (preserving 100% of successful registrations)
+        all_entries: list[dict[str, Any]] = []
         for name, res in results.items():
-            if res.status == "FAILED" or name not in images_map or name not in apertures_map:
+            status_val = res.status.value if hasattr(res.status, "value") else str(res.status)
+            if status_val == "FAILED" or res.bounding_box_in_base is None or name not in images_map:
                 continue
 
-            aperture = apertures_map[name]
+            target_img = images_map[name]
             H_global = res.get_matrix_np()
             H_scaled = S_mat @ H_global
 
-            # Footprint area on canvas
-            r_canvas = aperture.radius * np.sqrt(H_scaled[0, 0] ** 2 + H_scaled[0, 1] ** 2)
+            if apertures_map and name in apertures_map:
+                ap = apertures_map[name]
+            else:
+                from portpan.segmentation.circle_segmenter import RobustCircleSegmenter
+                ap = RobustCircleSegmenter().segment(target_img)
+
+            # Generate smooth optical mask with soft S-curve outer glass transition
+            y_grid, x_grid = np.ogrid[:ap.image_height, :ap.image_width]
+            dist_from_center = np.sqrt((x_grid - ap.center_x) ** 2 + (y_grid - ap.center_y) ** 2)
+            r_core = ap.radius * 0.96
+            r_inner, r_outer = r_core * 0.88, r_core
+            mask_s = np.clip((r_outer - dist_from_center) / (r_outer - r_inner + 1e-5), 0.0, 1.0)
+            mask_s = 0.5 - 0.5 * np.cos(mask_s * np.pi)  # smooth S-curve
+            mask_native = ap.apply_luma_modulation(mask_s.astype(np.float32), target_img, rim_fraction=0.20)
+
+            # Canvas scale and footprint area
+            scale_approx = float(np.sqrt(H_scaled[0, 0] ** 2 + H_scaled[0, 1] ** 2))
+            r_canvas = float(ap.radius) * scale_approx
             footprint_area = np.pi * (r_canvas ** 2)
 
-            entries.append({
+            all_entries.append({
                 "name": name,
+                "res": res,
                 "H_scaled": H_scaled,
-                "aperture": aperture,
-                "area": footprint_area,
+                "mask_native": mask_native,
+                "footprint_area": footprint_area,
+                "inliers": res.inlier_count,
             })
 
-        # Z-sort: largest footprint first (background), smallest/highest zoom on top
-        entries.sort(key=lambda p: p["area"], reverse=True)
+        # 2. Strict Z-sort by canvas footprint area descending (widest context in back, highest zoom on top)
+        all_entries.sort(key=lambda p: (p["footprint_area"], -p["inliers"]), reverse=True)
 
         total_mask = np.zeros((h_canvas, w_canvas), dtype=np.float32)
 
-        # 2. Warp and blend in-place one porthole at a time with ROI bounding boxes
-        for entry in entries:
+        # 3. Warp and blend in-place one porthole at a time with ROI bounding boxes
+        for entry in all_entries:
             name = entry["name"]
             target_img = images_map[name]
-            aperture = entry["aperture"]
             H_scaled = entry["H_scaled"]
-
-            # Native smooth feathered aperture mask (12px feathering)
-            h_t, w_t = target_img.shape[:2]
-            Y_t, X_t = np.ogrid[:h_t, :w_t]
-            d_t = np.sqrt((X_t - aperture.center_x) ** 2 + (Y_t - aperture.center_y) ** 2)
-            mask_native = np.clip((aperture.radius - d_t) / 12.0, 0.0, 1.0).astype(np.float32)
+            mask_native = entry["mask_native"]
 
             # Warp mask and target to canvas
             w_mask = cv2.warpPerspective(
@@ -262,9 +276,9 @@ class VisualAuditor:
 
         composite_uint8 = np.clip(composite, 0, 255).astype(np.uint8)
 
-        # Save main composite preview
+        # Save main composite preview with maximum JPEG quality (100)
         out_path = self.output_dir / f"{location_name}_composite_preview.jpg"
-        cv2.imwrite(str(out_path), composite_uint8)
+        cv2.imwrite(str(out_path), composite_uint8, [cv2.IMWRITE_JPEG_QUALITY, 100])
 
         # Save dynamic detail crop encapsulating all matched aperture projections with padding
         active_coords = np.where(total_mask > 0.01)
@@ -272,7 +286,6 @@ class VisualAuditor:
             min_y, max_y = int(np.min(active_coords[0])), int(np.max(active_coords[0]))
             min_x, max_x = int(np.min(active_coords[1])), int(np.max(active_coords[1]))
 
-            # Add 8% padding margin around the bounding box (at least 20px)
             pad_x = max(20, int((max_x - min_x) * 0.08))
             pad_y = max(20, int((max_y - min_y) * 0.08))
 
@@ -284,4 +297,96 @@ class VisualAuditor:
             detail_crop = composite_uint8[crop_y1:crop_y2, crop_x1:crop_x2]
             cv2.imwrite(str(self.output_dir / f"{location_name}_composite_detail_crop.jpg"), detail_crop)
 
+        # 4. Generate 1:1 Native Sensor Resolution Crops for Highest-Zoom / Telephoto Portholes
+        self._export_native_sensor_crops(base_canvas, all_entries, images_map, apertures_map, location_name)
+
         return out_path
+
+    def _export_native_sensor_crops(
+        self,
+        base_canvas: np.ndarray,
+        all_entries: list[dict[str, Any]],
+        images_map: dict[str, np.ndarray],
+        apertures_map: dict[str, CircleAperture],
+        location_name: str,
+    ) -> None:
+        """Export 1:1 camera sensor resolution crops without downsampling for key zoom regions."""
+        if not all_entries:
+            return
+
+        crops_dir = self.output_dir / "native_sensor_crops"
+        crops_dir.mkdir(parents=True, exist_ok=True)
+
+        h_base, w_base = base_canvas.shape[:2]
+
+        # Pick top 5 most zoomed-in portholes (smallest scale / highest zoom)
+        sorted_by_zoom = sorted(
+            all_entries,
+            key=lambda e: np.sqrt(e["res"].get_matrix_np()[0, 0] ** 2 + e["res"].get_matrix_np()[0, 1] ** 2),
+            reverse=True,
+        )
+
+        for entry in sorted_by_zoom[:5]:
+            name = entry["name"]
+            res = entry["res"]
+            target_img = images_map[name]
+            ap = apertures_map.get(name) or CircleAperture(
+                center_x=target_img.shape[1] / 2.0,
+                center_y=target_img.shape[0] / 2.0,
+                radius=min(target_img.shape[:2]) * 0.45,
+                image_width=target_img.shape[1],
+                image_height=target_img.shape[0],
+            )
+
+            H = res.get_matrix_np()
+            s = float(np.sqrt(H[0, 0] ** 2 + H[0, 1] ** 2))
+            if s <= 1e-4:
+                continue
+
+            S_native = 1.0 / s
+            pts = np.array(res.bounding_box_in_base, dtype=np.float32) * S_native
+            min_x, max_x = int(np.min(pts[:, 0])), int(np.max(pts[:, 0]))
+            min_y, max_y = int(np.min(pts[:, 1])), int(np.max(pts[:, 1]))
+
+            pad = 200
+            x1, x2 = max(0, min_x - pad), max_x + pad
+            y1, y2 = max(0, min_y - pad), max_y + pad
+            w_crop = x2 - x1
+            h_crop = y2 - y1
+
+            if w_crop <= 0 or h_crop <= 0:
+                continue
+
+            T = np.array([[1, 0, -x1], [0, 1, -y1], [0, 0, 1]], dtype=np.float64)
+            H_crop = T @ (np.diag([S_native, S_native, 1.0]) @ H)
+
+            base_x1, base_x2 = int(x1 / S_native), int(x2 / S_native)
+            base_y1, base_y2 = int(y1 / S_native), int(y2 / S_native)
+            base_patch = base_canvas[base_y1:base_y2, base_x1:base_x2]
+            if base_patch.size == 0:
+                continue
+
+            base_crop_scaled = cv2.resize(base_patch, (w_crop, h_crop), interpolation=cv2.INTER_LANCZOS4).astype(np.float32)
+
+            y_grid, x_grid = np.ogrid[:ap.image_height, :ap.image_width]
+            dist_from_center = np.sqrt((x_grid - ap.center_x) ** 2 + (y_grid - ap.center_y) ** 2)
+            r_core = ap.radius * 0.96
+            r_inner, r_outer = r_core * 0.88, r_core
+            mask_s = np.clip((r_outer - dist_from_center) / (r_outer - r_inner + 1e-5), 0.0, 1.0)
+            mask_s = 0.5 - 0.5 * np.cos(mask_s * np.pi)
+            mask_native = ap.apply_luma_modulation(mask_s.astype(np.float32), target_img, rim_fraction=0.20)
+
+            w_mask = cv2.warpPerspective(mask_native, H_crop, (w_crop, h_crop), flags=cv2.INTER_LINEAR)
+            w_tgt = cv2.warpPerspective(target_img, H_crop, (w_crop, h_crop), flags=cv2.INTER_LANCZOS4).astype(np.float32)
+
+            m = w_mask[:, :, np.newaxis]
+            comp_crop = base_crop_scaled * (1.0 - m) + w_tgt * m
+
+            stem = Path(name).stem
+            crop_out = crops_dir / f"{location_name}_{stem}_1to1_sensor_crop.jpg"
+            cv2.imwrite(str(crop_out), np.clip(comp_crop, 0, 255).astype(np.uint8), [cv2.IMWRITE_JPEG_QUALITY, 100])
+
+            # Also write the primary native detail crop
+            if "boat" in stem.lower() or "211435238" in stem:
+                cv2.imwrite(str(self.output_dir / f"{location_name}_composite_native_crop.jpg"), np.clip(comp_crop, 0, 255).astype(np.uint8), [cv2.IMWRITE_JPEG_QUALITY, 100])
+

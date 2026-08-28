@@ -15,8 +15,8 @@ class GeometricValidator:
         min_inlier_ratio: float = 0.18,
         min_area_ratio: float = 0.00005,
         max_area_ratio: float = 0.35,
-        max_aspect_deviation: float = 3.5,
-        max_condition_number: float = 50.0,
+        max_aspect_deviation: float = 1.35,
+        max_condition_number: float = 1.35,
     ) -> None:
         self.min_inliers = min_inliers
         self.min_inlier_ratio = min_inlier_ratio
