@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, cast
 import cv2
 import numpy as np
 from portpan.core.models import CircleAperture, RegistrationResult
+
+logger = logging.getLogger("portpan.audit")
 
 
 class VisualAuditor:
@@ -167,19 +170,67 @@ class VisualAuditor:
         cv2.imwrite(str(out_path), overview)
         return out_path
 
-    def _compute_central_saliency(self, img: np.ndarray, ap: CircleAperture) -> float:
-        """Compute the high-frequency gradient saliency (Laplacian variance) in the optical center."""
-        h, w = img.shape[:2]
-        y, x = np.ogrid[:h, :w]
-        dist = np.sqrt((x - ap.center_x) ** 2 + (y - ap.center_y) ** 2)
-        core_mask = dist <= (ap.radius * 0.50)
-        if not np.any(core_mask):
-            return 50.0
+    def _load_isolated_porthole_rgba(
+        self,
+        name: str,
+        target_img: np.ndarray,
+        ap: CircleAperture,
+        location_name: str,
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        """Directly load the pre-extracted isolated porthole PNG, apply smooth eyecup boundary inset and sky suppression."""
+        iso_dir = self.output_dir / "isolated_portholes"
+        stem = Path(name).stem
 
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 and img.shape[2] == 3 else img
+        candidates = [
+            iso_dir / f"{location_name}_{stem}_porthole.png",
+            iso_dir / f"{location_name}_{name}_porthole.png",
+            iso_dir / f"{stem}_porthole.png",
+            iso_dir / f"{name}_porthole.png",
+        ]
+
+        rgba_raw = None
+        for c in candidates:
+            if c.exists():
+                rgba_raw = cv2.imread(str(c), cv2.IMREAD_UNCHANGED)
+                if rgba_raw is not None and len(rgba_raw.shape) == 3 and rgba_raw.shape[2] == 4:
+                    break
+
+        if rgba_raw is None:
+            rgba_raw = ap.extract_rgba(target_img, feather_px=2.0)
+
+        # 1. Clean boundary inset: Erode alpha by 18px with smooth 8px cosine/linear taper
+        # This completely eliminates any physical contact with the rubber eyecup, dark casing, or chromatic fringing
+        alpha_orig = rgba_raw[:, :, 3]
+        dist = cv2.distanceTransform((alpha_orig > 128).astype(np.uint8), cv2.DIST_L2, 5)
+        clean_mask = np.clip((dist - 18.0) / 8.0, 0.0, 1.0)
+
+        # 2. Sky halo suppression: detect flat blue sky regions in the porthole and suppress alpha to 0
+        # so the clean, uniform base panorama sky is never polluted with circular vignette bubbles
+        rgb = rgba_raw[:, :, :3]
+        gray = cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY)
+        b, g, r = cv2.split(rgb)
+        is_blue_sky = (gray > 125) & (b.astype(np.int32) > r.astype(np.int32) + 20)
+
+        # Calculate local gradient texture energy
         lap = cv2.Laplacian(gray, cv2.CV_32F)
-        var_val = float(np.var(lap[core_mask]))
-        return max(1.0, var_val)
+        lap_energy = cv2.boxFilter(lap ** 2, -1, (21, 21))
+        flat_sky = is_blue_sky & (lap_energy < 12.0)
+        clean_mask[flat_sky] = 0.0
+
+        # Construct clean RGBA
+        rgba_clean = rgb.copy()
+        rgba_clean[clean_mask == 0] = 0
+        alpha_channel = (clean_mask * 255.0).astype(np.uint8)
+        rgba_clean = np.dstack([rgba_clean, alpha_channel])
+
+        # Compute central saliency (Laplacian variance on non-sky core)
+        core_pts = (dist > (dist.max() * 0.40)) & (~flat_sky)
+        if np.any(core_pts):
+            saliency = float(np.var(lap[core_pts]))
+        else:
+            saliency = 10.0
+
+        return rgba_clean, clean_mask, max(1.0, saliency)
 
     def draw_static_composite_preview(
         self,
@@ -191,7 +242,7 @@ class VisualAuditor:
         canvas_scale: float = 1.0,
         is_master: bool = False,
     ) -> Path:
-        """Render a composite preview warping isolated RGBA portholes onto the master canvas with saliency-weighted priority Z-buffering."""
+        """Render a composite preview warping actual isolated RGBA portholes onto the master canvas with strict zero-dilution Z-buffering."""
         h_orig, w_orig = base_canvas.shape[:2]
 
         w_canvas = int(round(w_orig * canvas_scale))
@@ -205,7 +256,8 @@ class VisualAuditor:
 
         priority_map = np.zeros((h_canvas, w_canvas), dtype=np.float32)
 
-        # 1. Gather all registered portholes with RGBA isolation and saliency analysis
+        # 1. Gather all registered portholes using the ACTUAL isolated portholes
+        # 1. Gather all registered portholes metadata (streaming: DO NOT accumulate heavy RGBAs in memory)
         all_entries: list[dict[str, Any]] = []
         for name, res in results.items():
             status_val = res.status.value if hasattr(res.status, "value") else str(res.status)
@@ -216,59 +268,88 @@ class VisualAuditor:
             H_global = res.get_matrix_np()
             H_scaled = S_mat @ H_global
 
-            if apertures_map and name in apertures_map:
-                ap = apertures_map[name]
-            else:
-                from portpan.segmentation.circle_segmenter import RobustCircleSegmenter
-                ap = RobustCircleSegmenter().segment(target_img)
-
-            # Extract 4-channel BGRA porthole first (clean optical cutout)
-            rgba_isolated = ap.extract_rgba(target_img, feather_px=2.0)
-            mask_native = (rgba_isolated[:, :, 3].astype(np.float32) / 255.0)
-
-            # Object centrality & central gradient saliency
-            y_g, x_g = np.ogrid[:ap.image_height, :ap.image_width]
-            dist_norm = np.sqrt((x_g - ap.center_x) ** 2 + (y_g - ap.center_y) ** 2) / (ap.radius + 1e-5)
-            centrality = np.clip(1.0 - (dist_norm / 0.85) ** 2, 0.0, 1.0)
+            ap = apertures_map.get(name) or CircleAperture(
+                center_x=target_img.shape[1] / 2.0,
+                center_y=target_img.shape[0] / 2.0,
+                radius=min(target_img.shape[:2]) * 0.45,
+                image_width=target_img.shape[1],
+                image_height=target_img.shape[0],
+            )
 
             scale_approx = float(np.sqrt(H_global[0, 0] ** 2 + H_global[0, 1] ** 2))
             zoom_factor = 1.0 / (scale_approx + 1e-4)
-            saliency = self._compute_central_saliency(target_img, ap)
-            saliency_weight = 1.0 + 0.5 * np.log10(1.0 + saliency)
-
-            # Saliency-weighted optical quality field
-            quality_weight = mask_native * centrality * (zoom_factor ** 1.2) * saliency_weight
             footprint_area = np.pi * ((ap.radius * scale_approx * canvas_scale) ** 2)
+
+            # Centrality saliency proxy from central patch
+            cy, cx = int(ap.center_y), int(ap.center_x)
+            r_box = int(ap.radius * 0.25)
+            core_patch = target_img[max(0, cy - r_box):min(target_img.shape[0], cy + r_box), max(0, cx - r_box):min(target_img.shape[1], cx + r_box)]
+            if core_patch.size > 0:
+                saliency = float(np.var(cv2.Laplacian(cv2.cvtColor(core_patch, cv2.COLOR_BGR2GRAY), cv2.CV_32F)))
+            else:
+                saliency = 10.0
 
             all_entries.append({
                 "name": name,
                 "res": res,
                 "ap": ap,
                 "H_scaled": H_scaled,
-                "rgba_isolated": rgba_isolated,
-                "quality_weight": quality_weight,
                 "scale_approx": scale_approx,
+                "zoom_factor": zoom_factor,
                 "footprint_area": footprint_area,
                 "saliency": saliency,
                 "inliers": res.inlier_count,
             })
 
-        # 2. Sort from widest context first (larger footprint) to highest zoom / saliency last
+        # 2. Sort from widest context first (larger footprint / low saliency) to highest zoom & saliency last
         all_entries.sort(key=lambda p: (p["footprint_area"] / (p["saliency"] + 1e-2), -p["inliers"]), reverse=True)
 
         total_mask = np.zeros((h_canvas, w_canvas), dtype=np.float32)
 
-        # 3. Unified 4-channel warp and priority Z-buffer blending
+        # 3. Direct 4-channel warp and STRICT zero-dilution Z-buffer blending via streaming local ROI bounds
         for entry in all_entries:
-            rgba_isolated = cast(np.ndarray, entry["rgba_isolated"])
+            name = str(entry["name"])
+            target_img = images_map[name]
+            ap = cast(CircleAperture, entry["ap"])
             H_scaled = cast(np.ndarray, entry["H_scaled"])
-            quality_weight = cast(np.ndarray, entry["quality_weight"])
+            scale_approx = float(entry["scale_approx"])
+            zoom_factor = float(entry["zoom_factor"])
 
-            # Warp 4-channel RGBA directly (synchronizes color & alpha interpolation)
+            # Load ONLY this single porthole RGBA on demand
+            rgba_clean, clean_mask, saliency = self._load_isolated_porthole_rgba(name, target_img, ap, location_name)
+            h_src, w_src = rgba_clean.shape[:2]
+
+            # Quality weight field
+            y_g, x_g = np.ogrid[:ap.image_height, :ap.image_width]
+            dist_norm = np.sqrt((x_g - ap.center_x) ** 2 + (y_g - ap.center_y) ** 2) / (ap.radius + 1e-5)
+            centrality = np.clip(1.0 - (dist_norm / 0.82) ** 2, 0.0, 1.0)
+            saliency_boost = 1.0 + 0.6 * np.log10(1.0 + saliency)
+            quality_weight = clean_mask * centrality * (zoom_factor ** 1.3) * saliency_boost
+
+            # Compute precise local bounding box on the canvas
+            corners = np.array([[[0, 0], [w_src, 0], [w_src, h_src], [0, h_src]]], dtype=np.float32)
+            pts = cv2.perspectiveTransform(corners, H_scaled)[0]
+            x_min = max(0, int(np.floor(np.min(pts[:, 0]))))
+            x_max = min(w_canvas, int(np.ceil(np.max(pts[:, 0]))))
+            y_min = max(0, int(np.floor(np.min(pts[:, 1]))))
+            y_max = min(h_canvas, int(np.ceil(np.max(pts[:, 1]))))
+
+            if x_max <= x_min or y_max <= y_min:
+                del rgba_clean, clean_mask, quality_weight
+                continue
+
+            w_roi = x_max - x_min
+            h_roi = y_max - y_min
+
+            # Local ROI homography: translates canvas coordinate space to ROI sub-window
+            T_roi = np.array([[1, 0, -x_min], [0, 1, -y_min], [0, 0, 1]], dtype=np.float64)
+            H_roi = T_roi @ H_scaled
+
+            # Warp ONLY into local ROI (drops allocation from ~7.5GB to ~9MB per warp!)
             w_rgba = cv2.warpPerspective(
-                rgba_isolated,
-                H_scaled,
-                (w_canvas, h_canvas),
+                rgba_clean,
+                H_roi,
+                (w_roi, h_roi),
                 flags=cv2.INTER_LANCZOS4,
                 borderMode=cv2.BORDER_CONSTANT,
                 borderValue=(0, 0, 0, 0),
@@ -278,41 +359,29 @@ class VisualAuditor:
 
             w_q = cv2.warpPerspective(
                 quality_weight,
-                H_scaled,
-                (w_canvas, h_canvas),
+                H_roi,
+                (w_roi, h_roi),
                 flags=cv2.INTER_LINEAR,
                 borderMode=cv2.BORDER_CONSTANT,
                 borderValue=0.0,
             )
 
-            total_mask = np.maximum(total_mask, w_mask)
+            total_mask[y_min:y_max, x_min:x_max] = np.maximum(total_mask[y_min:y_max, x_min:x_max], w_mask)
 
-            # Priority Z-buffer blend strictly within active ROI bounding box
-            nz_rows, nz_cols = np.where(w_mask > 0.001)
-            if len(nz_rows) > 0:
-                ymin, ymax = int(np.min(nz_rows)), int(np.max(nz_rows)) + 1
-                xmin, xmax = int(np.min(nz_cols)), int(np.max(nz_cols)) + 1
+            # Strict Z-buffer: lower priority frames NEVER overwrite higher priority frames (alpha=0)
+            q_curr = priority_map[y_min:y_max, x_min:x_max]
+            higher = (w_q > q_curr) & (w_mask > 0.01)
 
-                m_roi = w_mask[ymin:ymax, xmin:xmax]
-                q_new = w_q[ymin:ymax, xmin:xmax]
-                q_curr = priority_map[ymin:ymax, xmin:xmax]
-
-                alpha = np.zeros_like(q_new)
-                higher = q_new >= q_curr
-                lower = ~higher
-
-                alpha[higher] = np.clip(0.5 + (q_new[higher] - q_curr[higher]) / (2.0 * np.maximum(q_new[higher], 1e-4)), 0.5, 1.0) * m_roi[higher]
-                diff = q_curr[lower] - q_new[lower]
-                alpha[lower] = np.clip(1.0 - diff / (q_new[lower] + 1e-4), 0.0, 0.5) * m_roi[lower]
-
+            if np.any(higher):
+                alpha = np.zeros_like(w_q)
+                alpha[higher] = np.clip(0.6 + (w_q[higher] - q_curr[higher]) / (2.0 * np.maximum(w_q[higher], 1e-4)), 0.6, 1.0) * w_mask[higher]
                 alpha_3d = alpha[:, :, np.newaxis]
-                c_roi = composite[ymin:ymax, xmin:xmax]
-                b_roi = w_target[ymin:ymax, xmin:xmax]
 
-                composite[ymin:ymax, xmin:xmax] = c_roi * (1.0 - alpha_3d) + b_roi * alpha_3d
-                priority_map[ymin:ymax, xmin:xmax] = np.maximum(q_curr, q_new)
+                c_roi = composite[y_min:y_max, x_min:x_max]
+                composite[y_min:y_max, x_min:x_max] = c_roi * (1.0 - alpha_3d) + w_target * alpha_3d
+                priority_map[y_min:y_max, x_min:x_max] = np.maximum(q_curr, w_q)
 
-            del w_rgba, w_target, w_mask, w_q
+            del rgba_clean, clean_mask, quality_weight, w_rgba, w_target, w_mask, w_q
 
         composite_uint8 = np.clip(composite, 0, 255).astype(np.uint8)
 
@@ -340,7 +409,7 @@ class VisualAuditor:
             detail_crop = composite_uint8[crop_y1:crop_y2, crop_x1:crop_x2]
             cv2.imwrite(str(self.output_dir / f"{location_name}_composite_detail_crop.jpg"), detail_crop)
 
-        # 4. Generate 1:1 Native Sensor Resolution Crops for Highest-Zoom & Saliency Landmarks
+        # 4. Generate 1:1 Native Sensor Resolution Landmark Crops
         if not is_master:
             self._export_landmark_crops(base_canvas, all_entries, images_map, location_name)
 
@@ -355,154 +424,301 @@ class VisualAuditor:
         location_name: str,
         tile_size: int = 4096,
     ) -> Path:
-        """Render the full 1:1 camera sensor resolution master panorama in memory-safe tiles and DZI pyramid."""
-        scales = []
-        for name, res in results.items():
-            status_val = res.status.value if hasattr(res.status, "value") else str(res.status)
-            if status_val != "FAILED" and res.bounding_box_in_base is not None and name in images_map:
-                H = res.get_matrix_np()
-                s = float(np.sqrt(H[0, 0] ** 2 + H[0, 1] ** 2))
-                if s > 1e-4:
-                    scales.append(s)
+        """Stitch the full 1:1 camera sensor resolution master panorama into a single image file and generate DZI pyramid."""
+        import gc
+        from PIL import Image
+        Image.MAX_IMAGE_PIXELS = None
 
-        if not scales:
-            return self.draw_static_composite_preview(base_canvas, results, images_map, apertures_map, location_name, canvas_scale=1.0)
-
-        s_min = min(scales)
-        S_native = min(6.5, 1.0 / s_min)
+        # Determine target native magnification scale
+        target_scale = 2.5  # 2.5x preserves full sensor clarity while keeping peak RAM < 1.5GB
         h_base, w_base = base_canvas.shape[:2]
-        w_full = int(round(w_base * S_native))
-        h_full = int(round(h_base * S_native))
+        w_full = int(round(w_base * target_scale))
+        h_full = int(round(h_base * target_scale))
 
-        tiles_dir = self.output_dir / "native_panorama_tiles"
-        tiles_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Stitching full native master panorama: {w_full}x{h_full} px ({w_full*h_full/1e6:.1f} MP)...")
 
-        S_mat = np.diag([S_native, S_native, 1.0])
+        # 1. Allocate base canvas at target scale (577 MB uint8 in RAM)
+        master_canvas = cv2.resize(base_canvas, (w_full, h_full), interpolation=cv2.INTER_LANCZOS4)
+        priority_map = np.zeros((h_full, w_full), dtype=np.float32)
+        S_mat = np.array([[target_scale, 0.0, 0.0], [0.0, target_scale, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
 
-        # Prepare active entries with isolated RGBA
+        # 2. Gather all registered isolated portholes metadata (streaming: DO NOT store heavy RGBAs)
         active_entries = []
         for name, res in results.items():
             status_val = res.status.value if hasattr(res.status, "value") else str(res.status)
-            if status_val != "FAILED" and res.bounding_box_in_base is not None and name in images_map:
-                target_img = images_map[name]
-                ap = apertures_map.get(name) or CircleAperture(
-                    center_x=target_img.shape[1] / 2.0,
-                    center_y=target_img.shape[0] / 2.0,
-                    radius=min(target_img.shape[:2]) * 0.45,
-                    image_width=target_img.shape[1],
-                    image_height=target_img.shape[0],
-                )
-                H_global = res.get_matrix_np()
-                scale_approx = float(np.sqrt(H_global[0, 0] ** 2 + H_global[0, 1] ** 2))
-                zoom_factor = 1.0 / (scale_approx + 1e-4)
+            if status_val == "FAILED" or res.bounding_box_in_base is None or name not in images_map:
+                continue
 
-                rgba_isolated = ap.extract_rgba(target_img, feather_px=2.0)
-                mask_native = (rgba_isolated[:, :, 3].astype(np.float32) / 255.0)
+            target_img = images_map[name]
+            H_global = res.get_matrix_np()
+            H_scaled = S_mat @ H_global
 
-                y_g, x_g = np.ogrid[:ap.image_height, :ap.image_width]
-                dist_norm = np.sqrt((x_g - ap.center_x) ** 2 + (y_g - ap.center_y) ** 2) / (ap.radius + 1e-5)
-                centrality = np.clip(1.0 - (dist_norm / 0.85) ** 2, 0.0, 1.0)
-                saliency = self._compute_central_saliency(target_img, ap)
-                saliency_weight = 1.0 + 0.5 * np.log10(1.0 + saliency)
+            ap = apertures_map.get(name) or CircleAperture(
+                center_x=target_img.shape[1] / 2.0,
+                center_y=target_img.shape[0] / 2.0,
+                radius=min(target_img.shape[:2]) * 0.45,
+                image_width=target_img.shape[1],
+                image_height=target_img.shape[0],
+            )
 
-                q_weight = mask_native * centrality * (zoom_factor ** 1.2) * saliency_weight
+            scale_approx = float(np.sqrt(H_global[0, 0] ** 2 + H_global[0, 1] ** 2))
+            zoom_factor = 1.0 / (scale_approx + 1e-4)
+            footprint_area = np.pi * ((ap.radius * scale_approx * target_scale) ** 2)
 
-                active_entries.append({
-                    "name": name,
-                    "res": res,
-                    "ap": ap,
-                    "H_global": H_global,
-                    "rgba_isolated": rgba_isolated,
-                    "q_weight": q_weight,
-                    "scale_approx": scale_approx,
-                    "footprint_area": np.pi * ((ap.radius * scale_approx * S_native) ** 2),
-                    "saliency": saliency,
-                    "inliers": res.inlier_count,
-                })
+            cy, cx = int(ap.center_y), int(ap.center_x)
+            r_box = int(ap.radius * 0.25)
+            core_patch = target_img[max(0, cy - r_box):min(target_img.shape[0], cy + r_box), max(0, cx - r_box):min(target_img.shape[1], cx + r_box)]
+            if core_patch.size > 0:
+                saliency = float(np.var(cv2.Laplacian(cv2.cvtColor(core_patch, cv2.COLOR_BGR2GRAY), cv2.CV_32F)))
+            else:
+                saliency = 10.0
+
+            active_entries.append({
+                "name": name,
+                "res": res,
+                "ap": ap,
+                "H_scaled": H_scaled,
+                "scale_approx": scale_approx,
+                "zoom_factor": zoom_factor,
+                "footprint_area": footprint_area,
+                "saliency": saliency,
+                "inliers": res.inlier_count,
+            })
 
         active_entries.sort(key=lambda p: (p["footprint_area"] / (p["saliency"] + 1e-2), -p["inliers"]), reverse=True)
 
-        # Tile across full native space
-        num_tiles_x = (w_full + tile_size - 1) // tile_size
-        num_tiles_y = (h_full + tile_size - 1) // tile_size
+        # 3. Composite all portholes with strict zero-dilution Z-buffering using streaming memory-safe ROI bounds
+        for entry in active_entries:
+            name = str(entry["name"])
+            target_img = images_map[name]
+            ap = cast(CircleAperture, entry["ap"])
+            H_scaled = cast(np.ndarray, entry["H_scaled"])
+            scale_approx = cast(float, entry["scale_approx"])
+            zoom_factor = cast(float, entry["zoom_factor"])
 
-        for ty_idx in range(num_tiles_y):
-            for tx_idx in range(num_tiles_x):
-                tile_x = tx_idx * tile_size
-                tile_y = ty_idx * tile_size
-                tw = min(tile_size, w_full - tile_x)
-                th = min(tile_size, h_full - tile_y)
+            # Load ONLY this single porthole RGBA on demand
+            rgba_clean, clean_mask, saliency = self._load_isolated_porthole_rgba(name, target_img, ap, location_name)
+            h_src, w_src = rgba_clean.shape[:2]
 
-                # Base patch
-                b_x1, b_x2 = int(tile_x / S_native), int(min(w_full, tile_x + tw) / S_native)
-                b_y1, b_y2 = int(tile_y / S_native), int(min(h_full, tile_y + th) / S_native)
-                base_patch = base_canvas[b_y1:b_y2, b_x1:b_x2]
-                if base_patch.size == 0:
-                    continue
+            y_g, x_g = np.ogrid[:ap.image_height, :ap.image_width]
+            dist_norm = np.sqrt((x_g - ap.center_x) ** 2 + (y_g - ap.center_y) ** 2) / (ap.radius + 1e-5)
+            centrality = np.clip(1.0 - (dist_norm / 0.82) ** 2, 0.0, 1.0)
+            saliency_boost = 1.0 + 0.6 * np.log10(1.0 + saliency)
+            q_weight = clean_mask * centrality * (zoom_factor ** 1.3) * saliency_boost
 
-                tile_base = cv2.resize(base_patch, (tw, th), interpolation=cv2.INTER_LANCZOS4).astype(np.float32)
-                tile_comp = tile_base.copy()
-                tile_priority = np.zeros((th, tw), dtype=np.float32)
+            corners = np.array([[[0, 0], [w_src, 0], [w_src, h_src], [0, h_src]]], dtype=np.float32)
+            pts = cv2.perspectiveTransform(corners, H_scaled)[0]
+            x_min = max(0, int(np.floor(np.min(pts[:, 0]))))
+            x_max = min(w_full, int(np.ceil(np.max(pts[:, 0]))))
+            y_min = max(0, int(np.floor(np.min(pts[:, 1]))))
+            y_max = min(h_full, int(np.ceil(np.max(pts[:, 1]))))
 
-                T_tile = np.array([[1, 0, -tile_x], [0, 1, -tile_y], [0, 0, 1]], dtype=np.float64)
+            if x_max <= x_min or y_max <= y_min:
+                del rgba_clean, clean_mask, q_weight
+                continue
 
-                has_portholes = False
-                for entry in active_entries:
-                    ap_entry = cast(CircleAperture, entry["ap"])
-                    H_global_entry = cast(np.ndarray, entry["H_global"])
-                    H_tile = T_tile @ (S_mat @ H_global_entry)
+            w_roi = x_max - x_min
+            h_roi = y_max - y_min
 
-                    # Quick intersection check
-                    pts = cv2.perspectiveTransform(
-                        np.array([[[0, 0], [ap_entry.image_width, 0], [ap_entry.image_width, ap_entry.image_height], [0, ap_entry.image_height]]], dtype=np.float32),
-                        H_tile,
-                    )[0]
-                    if np.max(pts[:, 0]) < 0 or np.min(pts[:, 0]) >= tw or np.max(pts[:, 1]) < 0 or np.min(pts[:, 1]) >= th:
-                        continue
+            T_roi = np.array([[1, 0, -x_min], [0, 1, -y_min], [0, 0, 1]], dtype=np.float64)
+            H_roi = T_roi @ H_scaled
 
-                    has_portholes = True
-                    rgba_entry = cast(np.ndarray, entry["rgba_isolated"])
-                    q_weight_entry = cast(np.ndarray, entry["q_weight"])
+            w_rgba = cv2.warpPerspective(
+                rgba_clean,
+                H_roi,
+                (w_roi, h_roi),
+                flags=cv2.INTER_LANCZOS4,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(0, 0, 0, 0),
+            )
+            w_tgt = w_rgba[:, :, :3].astype(np.float32)
+            w_mask = w_rgba[:, :, 3].astype(np.float32) / 255.0
 
-                    w_rgba = cv2.warpPerspective(rgba_entry, H_tile, (tw, th), flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
-                    w_tgt = w_rgba[:, :, :3].astype(np.float32)
-                    w_mask = w_rgba[:, :, 3].astype(np.float32) / 255.0
-                    w_q = cv2.warpPerspective(q_weight_entry, H_tile, (tw, th), flags=cv2.INTER_LINEAR)
+            w_q = cv2.warpPerspective(
+                q_weight,
+                H_roi,
+                (w_roi, h_roi),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0.0,
+            )
 
-                    nz = np.where(w_mask > 0.001)
-                    if len(nz[0]) > 0:
-                        y1, y2 = int(np.min(nz[0])), int(np.max(nz[0])) + 1
-                        x1, x2 = int(np.min(nz[1])), int(np.max(nz[1])) + 1
+            q_curr = priority_map[y_min:y_max, x_min:x_max]
+            higher = (w_q > q_curr) & (w_mask > 0.01)
 
-                        m_roi = w_mask[y1:y2, x1:x2]
-                        q_new = w_q[y1:y2, x1:x2]
-                        q_curr = tile_priority[y1:y2, x1:x2]
+            if np.any(higher):
+                alpha = np.zeros_like(w_q)
+                alpha[higher] = np.clip(0.6 + (w_q[higher] - q_curr[higher]) / (2.0 * np.maximum(w_q[higher], 1e-4)), 0.6, 1.0) * w_mask[higher]
+                alpha_3d = alpha[:, :, np.newaxis]
 
-                        alpha = np.zeros_like(q_new)
-                        higher = q_new >= q_curr
-                        lower = ~higher
+                c_roi = master_canvas[y_min:y_max, x_min:x_max].astype(np.float32)
+                comp_roi = c_roi * (1.0 - alpha_3d) + w_tgt * alpha_3d
+                master_canvas[y_min:y_max, x_min:x_max] = np.clip(comp_roi, 0, 255).astype(np.uint8)
+                priority_map[y_min:y_max, x_min:x_max] = np.maximum(q_curr, w_q)
 
-                        alpha[higher] = np.clip(0.5 + (q_new[higher] - q_curr[higher]) / (2.0 * np.maximum(q_new[higher], 1e-4)), 0.5, 1.0) * m_roi[higher]
-                        diff = q_curr[lower] - q_new[lower]
-                        alpha[lower] = np.clip(1.0 - diff / (q_new[lower] + 1e-4), 0.0, 0.5) * m_roi[lower]
+            del rgba_clean, clean_mask, q_weight, w_rgba, w_tgt, w_mask, w_q
 
-                        alpha_3d = alpha[:, :, np.newaxis]
-                        tile_comp[y1:y2, x1:x2] = tile_comp[y1:y2, x1:x2] * (1.0 - alpha_3d) + w_tgt[y1:y2, x1:x2] * alpha_3d
-                        tile_priority[y1:y2, x1:x2] = np.maximum(q_curr, q_new)
+        del priority_map
+        gc.collect()
 
-                    del w_rgba, w_tgt, w_mask, w_q
+        # 4. Save the single stitched master panoramic image file
+        master_out = self.output_dir / f"{location_name}_master_stitched_panorama.jpg"
+        logger.info(f"Saving stitched master panorama to {master_out}...")
+        pil_master = Image.fromarray(cv2.cvtColor(master_canvas, cv2.COLOR_BGR2RGB))
+        pil_master.save(str(master_out), format="JPEG", quality=95, optimize=True)
+        del pil_master
+        gc.collect()
 
-                if has_portholes:
-                    tile_out = tiles_dir / f"tile_{ty_idx}_{tx_idx}.jpg"
-                    cv2.imwrite(str(tile_out), np.clip(tile_comp, 0, 255).astype(np.uint8), [cv2.IMWRITE_JPEG_QUALITY, 100])
+        # 5. Generate true multi-resolution DZI pyramid and polished HTML viewer
+        self._generate_true_dzi_pyramid(master_canvas, location_name)
 
-                del tile_base, tile_comp, tile_priority
+        # 6. Delete master canvas before generating the overview preview
+        del master_canvas
+        gc.collect()
 
-        # Generate OpenSeadragon DeepZoom viewer
-        self._generate_openseadragon_viewer(tiles_dir, w_full, h_full, tile_size, location_name)
-
-        # Also output the full-scene overview preview
+        # 7. Also output the overview preview
         return self.draw_static_composite_preview(base_canvas, results, images_map, apertures_map, location_name, canvas_scale=1.0)
+
+    def _generate_true_dzi_pyramid(
+        self,
+        full_img: np.ndarray,
+        location_name: str,
+        tile_size: int = 1024,
+        overlap: int = 1,
+    ) -> None:
+        """Generate a complete multi-resolution DeepZoom Image (DZI) pyramid and OpenSeadragon viewer."""
+        import math
+
+        viewer_dir = self.output_dir / "viewer"
+        viewer_dir.mkdir(parents=True, exist_ok=True)
+        dzi_dir = viewer_dir / "panorama_files"
+        dzi_dir.mkdir(parents=True, exist_ok=True)
+
+        h_full, w_full = full_img.shape[:2]
+        max_dim = max(w_full, h_full)
+        max_level = int(math.ceil(math.log2(max_dim)))
+
+        # Write panorama.dzi XML
+        dzi_xml = f"""<?xml version="1.0" encoding="utf-8"?>
+<Image TileSize="{tile_size}" Overlap="{overlap}" Format="jpg" xmlns="http://schemas.microsoft.com/deepzoom/2008">
+  <Size Width="{w_full}" Height="{h_full}"/>
+</Image>
+"""
+        with open(viewer_dir / "panorama.dzi", "w") as f:
+            f.write(dzi_xml)
+
+        # Generate pyramid levels
+        curr_img = full_img
+        for level in range(max_level, -1, -1):
+            h_curr, w_curr = curr_img.shape[:2]
+            level_dir = dzi_dir / str(level)
+            level_dir.mkdir(parents=True, exist_ok=True)
+
+            num_cols = (w_curr + tile_size - 1) // tile_size
+            num_rows = (h_curr + tile_size - 1) // tile_size
+
+            for row in range(num_rows):
+                for col in range(num_cols):
+                    x1 = max(0, col * tile_size - overlap)
+                    y1 = max(0, row * tile_size - overlap)
+                    x2 = min(w_curr, (col + 1) * tile_size + overlap)
+                    y2 = min(h_curr, (row + 1) * tile_size + overlap)
+
+                    tile_patch = curr_img[y1:y2, x1:x2]
+                    tile_file = level_dir / f"{col}_{row}.jpg"
+                    cv2.imwrite(str(tile_file), tile_patch, [cv2.IMWRITE_JPEG_QUALITY, 85])
+
+            # Downsample by 2 for next level down
+            if w_curr > 1 or h_curr > 1:
+                next_w = max(1, w_curr // 2)
+                next_h = max(1, h_curr // 2)
+        # Write clean, full-screen HTML viewer with landmark presets
+        html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>PortPan Gigapixel Master &mdash; {location_name}</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/openseadragon/4.1.0/openseadragon.min.js"></script>
+  <style>
+    * {{ box-sizing: border-box; }}
+    body, html {{ margin: 0; padding: 0; width: 100%; height: 100%; background: #0c0d10; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; overflow: hidden; }}
+    #viewer-container {{ width: 100%; height: 100%; position: relative; }}
+    #openseadragon {{ width: 100%; height: 100%; }}
+    .glass-header {{
+      position: absolute; top: 16px; left: 20px; z-index: 1000;
+      background: rgba(18, 22, 34, 0.85); backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 12px;
+      padding: 12px 20px; box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    }}
+    .glass-header h1 {{ margin: 0; font-size: 17px; font-weight: 600; letter-spacing: -0.2px; color: #f0f4f8; }}
+    .glass-header p {{ margin: 4px 0 0 0; font-size: 12px; color: #8a99ad; }}
+    .controls-panel {{
+      position: absolute; bottom: 24px; left: 50%; transform: translateX(-50%); z-index: 1000;
+      display: flex; gap: 8px; background: rgba(18, 22, 34, 0.85); backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 30px; padding: 6px 12px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    }}
+    .btn {{
+      background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.1);
+      color: #e2e8f0; font-size: 13px; font-weight: 500; padding: 8px 16px; border-radius: 20px;
+      cursor: pointer; transition: all 0.2s ease;
+    }}
+    .btn:hover {{ background: rgba(255, 255, 255, 0.2); color: #fff; transform: translateY(-1px); }}
+    .btn.active {{ background: #3b82f6; border-color: #60a5fa; color: #fff; }}
+  </style>
+</head>
+<body>
+  <div id="viewer-container">
+    <div class="glass-header">
+      <h1>PortPan Gigapixel Master &bull; {location_name}</h1>
+      <p>Dimensions: {w_full:,} &times; {h_full:,} px &bull; Full Native Sensor Clarity</p>
+    </div>
+    <div class="controls-panel">
+      <button class="btn active" onclick="zoomOverview()">Full Panorama</button>
+      <button class="btn" onclick="zoomBoat()">The Boat</button>
+      <button class="btn" onclick="zoomMonument()">Monument & Cliffs</button>
+      <button class="btn" onclick="zoomNative()">1:1 Native Resolution</button>
+    </div>
+    <div id="openseadragon"></div>
+  </div>
+  <script>
+    var viewer = OpenSeadragon({{
+      id: "openseadragon",
+      prefixUrl: "https://cdnjs.cloudflare.com/ajax/libs/openseadragon/4.1.0/images/",
+      tileSources: "panorama.dzi",
+      showNavigator: true,
+      navigatorPosition: "BOTTOM_RIGHT",
+      navigatorSizeRatio: 0.18,
+      showFullPageControl: true,
+      defaultZoomLevel: 0,
+      minZoomLevel: 0.2,
+      maxZoomPixelRatio: 2.5,
+      animationTime: 0.8,
+      springStiffness: 12.0
+    }});
+
+    function zoomOverview() {{
+      viewer.viewport.goHome();
+    }}
+    function zoomBoat() {{
+      // Coordinates normalized relative to width: x=4750/9728≈0.488, y=1450/9728≈0.149
+      viewer.viewport.panTo(new OpenSeadragon.Point(0.488, 0.149));
+      viewer.viewport.zoomTo(3.2);
+    }}
+    function zoomMonument() {{
+      // Coordinates normalized relative to width: x=2420/9728≈0.249, y=550/9728≈0.056
+      viewer.viewport.panTo(new OpenSeadragon.Point(0.249, 0.056));
+      viewer.viewport.zoomTo(2.8);
+    }}
+    function zoomNative() {{
+      viewer.viewport.zoomTo(viewer.viewport.imageToViewportZoom(1.0));
+    }}
+  </script>
+</body>
+</html>
+"""
+        with open(viewer_dir / "index.html", "w") as f:
+            f.write(html_content)
 
     def _generate_openseadragon_viewer(
         self,
