@@ -147,22 +147,13 @@ class CircleAperture(BaseModel):
 
     @staticmethod
     def apply_luma_modulation(
-        mask: np.ndarray, image: np.ndarray, rim_fraction: float = 0.15
+        mask: np.ndarray, image: np.ndarray, rim_fraction: float = 0.20
     ) -> np.ndarray:
         """Apply adaptive chroma- and luma-aware transparency modulation to an alpha mask.
 
         Fades dark bevel regions to transparent in the outer rim zone so they
         don't occlude overlapping porthole detail, while keeping the vibrant
-        blue/cyan chromatic fringe fully opaque. Works on both uint8 (0-255)
-        and float32 (0.0-1.0) masks.
-
-        Args:
-            mask: 2D alpha mask (uint8 0-255 or float32 0.0-1.0).
-            image: BGR source image for luma and chromaticity extraction.
-            rim_fraction: Fraction of mask radius defining the outer rim zone.
-
-        Returns:
-            Modulated mask in the same dtype as input.
+        blue/cyan chromatic fringe fully opaque.
         """
         import cv2
 
@@ -177,65 +168,57 @@ class CircleAperture(BaseModel):
             g = image[:, :, 1].astype(np.float32)
             r = image[:, :, 2].astype(np.float32)
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            # Blue chromatic excess indicates the true optical boundary fringe
             blue_excess = b - 0.5 * (r + g)
         else:
             gray = image
             blue_excess = np.zeros_like(gray, dtype=np.float32)
 
-        # Distance transform to apply modulation in the outer rim zone
         dist = cv2.distanceTransform((mask_u8 > 0).astype(np.uint8), cv2.DIST_L2, 5)
         max_d = float(np.max(dist)) if np.max(dist) > 0 else 1.0
 
-        # Interior reference luminance (median of central aperture core)
-        interior_mask = dist > (max_d * 0.35)
+        interior_mask = dist > (max_d * 0.40)
         if np.any(interior_mask):
             luma_ref = float(np.median(gray[interior_mask]))
         else:
             luma_ref = 120.0
 
-        # Rim factor: 0.0 at inner rim boundary, 1.0 at outer mask perimeter
         rim_factor = np.clip(1.0 - (dist / (max_d * rim_fraction + 1e-5)), 0.0, 1.0)
+        chroma_boost = np.clip((blue_excess - 5.0) / 20.0, 0.0, 1.0)
 
-        # Chromatic boost preserves the cyan/blue dispersion ring
-        chroma_boost = np.clip((blue_excess - 5.0) / 25.0, 0.0, 1.0)
+        luma_thresh = max(60.0, luma_ref * 0.45)
+        dark_casing = (rim_factor > 0.1) & (gray.astype(np.float32) < luma_thresh) & (blue_excess < 15.0)
 
-        # Dark bevel falloff: dark eyecup plastic (gray 20-75) fades to 0
-        luma_thresh_high = max(55.0, luma_ref * 0.50)
-        luma_thresh_low = 22.0
-        luma_alpha = np.clip((gray.astype(np.float32) - luma_thresh_low) / (luma_thresh_high - luma_thresh_low + 1e-5), 0.0, 1.0)
-
-        # Effective alpha in rim: opaque if bright OR if chromatic blue ring
-        effective_alpha = np.maximum(chroma_boost, luma_alpha)
-
-        mask_f = (mask_u8.astype(np.float32) / 255.0) * (1.0 - rim_factor * (1.0 - effective_alpha))
+        mask_f = mask_u8.astype(np.float32) / 255.0
+        mask_f[dark_casing] = 0.0
+        mask_f = cv2.GaussianBlur(mask_f, (5, 5), 1.0)
 
         if is_float:
             return np.clip(mask_f, 0.0, 1.0).astype(np.float32)
         return (np.clip(mask_f, 0.0, 1.0) * 255.0).astype(np.uint8)
 
     def generate_mask(self, feather_px: float = 2.0, image: np.ndarray | None = None) -> np.ndarray:
-        """Generate a 2D uint8 alpha mask (0-255) preserving the chromatic aberration ring with anti-aliasing."""
+        """Generate a 2D uint8 alpha mask (0-255) tightly bounded to optical glass with anti-aliasing."""
         import cv2
 
-        mask = np.zeros((self.image_height, self.image_width), dtype=np.uint8)
+        h, w = self.image_height, self.image_width
+        y, x = np.ogrid[:h, :w]
+        dist = np.sqrt((x - self.center_x) ** 2 + (y - self.center_y) ** 2)
+        r_norm = dist / (self.radius + 1e-5)
 
-        if self.boundary_polygon and len(self.boundary_polygon) >= 3:
-            pts = np.array(self.boundary_polygon, dtype=np.int32).reshape((-1, 1, 2))
-            cv2.fillPoly(mask, [pts], 255, lineType=cv2.LINE_AA)
-        else:
-            center = (int(round(self.center_x)), int(round(self.center_y)))
-            radius_int = int(round(self.radius))
-            cv2.circle(mask, center, radius_int, 255, -1, lineType=cv2.LINE_AA)
-
-        if feather_px > 0:
-            ksize = int(round(feather_px * 2)) | 1  # ensure odd kernel size
-            mask = cv2.GaussianBlur(mask, (ksize, ksize), feather_px / 2.0)
+        mask_f = np.zeros((h, w), dtype=np.float32)
+        core = r_norm <= 0.82
+        transition = (r_norm > 0.82) & (r_norm < 0.88)
+        mask_f[core] = 1.0
+        u = (r_norm[transition] - 0.82) / (0.88 - 0.82)
+        mask_f[transition] = 0.5 + 0.5 * np.cos(np.pi * u)
 
         if image is not None:
-            mask = CircleAperture.apply_luma_modulation(mask, image)
+            mask_f = CircleAperture.apply_luma_modulation(mask_f, image)
+        elif feather_px > 0:
+            ksize = int(round(feather_px * 2)) | 1
+            mask_f = cv2.GaussianBlur(mask_f, (ksize, ksize), feather_px / 2.0)
 
-        return mask
+        return (np.clip(mask_f * 255.0, 0.0, 255.0)).astype(np.uint8)
 
     def extract_rgba(self, image: np.ndarray, feather_px: float = 2.0) -> np.ndarray:
         """Extract a transparent 4-channel BGRA/RGBA porthole image retaining the full chromatic boundary."""

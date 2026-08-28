@@ -249,5 +249,6 @@ class RegistrationPipeline:
         if self.auditor and generate_audit_images:
             self.auditor.draw_global_canvas_overview(base_canvas, results, loc_name)
             self.auditor.draw_static_composite_preview(base_canvas, results, images_map, apertures_map, loc_name)
+            self.auditor.draw_master_gigapixel_panorama(base_canvas, results, images_map, apertures_map, loc_name)
 
         return loc_transforms
