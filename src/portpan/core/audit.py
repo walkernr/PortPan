@@ -198,11 +198,14 @@ class VisualAuditor:
         if rgba_raw is None:
             rgba_raw = ap.extract_rgba(target_img, feather_px=2.0)
 
-        # 1. Clean boundary inset: Erode alpha by 18px with smooth 10px cosine taper
+        # 1. Clean boundary inset: Adaptive radial inset (9% of aperture radius) with smooth 6% cosine taper
         # This completely eliminates any physical contact with the rubber eyecup, dark casing, or chromatic fringing
         alpha_orig = rgba_raw[:, :, 3].astype(np.float32)
         dist = cv2.distanceTransform((alpha_orig > 128).astype(np.uint8), cv2.DIST_L2, 5)
-        clean_mask = np.clip((dist - 18.0) / 10.0, 0.0, 1.0)
+        r_max = float(dist.max()) if dist.size > 0 else 1000.0
+        inset = max(30.0, 0.09 * r_max)
+        taper_width = max(20.0, 0.06 * r_max)
+        clean_mask = np.clip((dist - inset) / taper_width, 0.0, 1.0)
         clean_mask = 0.5 * (1.0 - np.cos(np.pi * clean_mask))
 
         rgb = rgba_raw[:, :, :3]
@@ -365,8 +368,11 @@ class VisualAuditor:
             if np.any(higher):
                 # Multi-band detail fusion: match low-frequency illumination to canvas, eliminating veiling glare
                 # while preserving 100% of native optical sensor sharpness and contrast on landmarks
+                # Use normalized convolution so low-frequency illumination never collapses near mask boundaries
                 ksize = 61
-                tgt_low = cv2.GaussianBlur(w_target, (ksize, ksize), 0)
+                tgt_low_num = cv2.GaussianBlur(w_target * w_mask[:, :, np.newaxis], (ksize, ksize), 0)
+                tgt_low_den = cv2.GaussianBlur(w_mask, (ksize, ksize), 0)[:, :, np.newaxis] + 1e-5
+                tgt_low = tgt_low_num / tgt_low_den
                 canvas_low = cv2.GaussianBlur(composite[y_min:y_max, x_min:x_max], (ksize, ksize), 0)
                 matched_target = canvas_low + (w_target - tgt_low)
 
@@ -549,8 +555,11 @@ class VisualAuditor:
 
                 # Multi-band detail fusion: match low-frequency illumination to canvas, eliminating veiling glare
                 # while preserving 100% of native optical sensor sharpness and contrast on landmarks
+                # Use normalized convolution so low-frequency illumination never collapses near mask boundaries
                 ksize = 61
-                tgt_low = cv2.GaussianBlur(w_tgt, (ksize, ksize), 0)
+                tgt_low_num = cv2.GaussianBlur(w_tgt * w_mask[:, :, np.newaxis], (ksize, ksize), 0)
+                tgt_low_den = cv2.GaussianBlur(w_mask, (ksize, ksize), 0)[:, :, np.newaxis] + 1e-5
+                tgt_low = tgt_low_num / tgt_low_den
                 canvas_low = cv2.GaussianBlur(c_roi, (ksize, ksize), 0)
                 matched_tgt = canvas_low + (w_tgt - tgt_low)
 
@@ -639,6 +648,20 @@ class VisualAuditor:
             if w_curr > 1 or h_curr > 1:
                 next_w = max(1, w_curr // 2)
                 next_h = max(1, h_curr // 2)
+        # Dynamic landmark presets per location
+        if "timber_cove" in location_name:
+            preset1_name, p1_x, p1_y, p1_zoom = "The Boat", 0.488, 0.149, 3.2
+            preset2_name, p2_x, p2_y, p2_zoom = "Monument & Cliffs", 0.249, 0.056, 2.8
+        elif "kolmer" in location_name:
+            preset1_name, p1_x, p1_y, p1_zoom = "Headland Ridge", 0.70, 0.288, 2.5
+            preset2_name, p2_x, p2_y, p2_zoom = "Coastal Cove & Rocks", 0.475, 0.35, 2.5
+        elif "windermere" in location_name:
+            preset1_name, p1_x, p1_y, p1_zoom = "Overlook Bluff", 0.582, 0.35, 2.5
+            preset2_name, p2_x, p2_y, p2_zoom = "Rocky Shoreline", 0.462, 0.42, 2.5
+        else:
+            preset1_name, p1_x, p1_y, p1_zoom = "Focal Target 1", 0.5, 0.3, 2.0
+            preset2_name, p2_x, p2_y, p2_zoom = "Focal Target 2", 0.7, 0.3, 2.0
+
         # Write clean, full-screen HTML viewer with landmark presets
         html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -682,8 +705,8 @@ class VisualAuditor:
     </div>
     <div class="controls-panel">
       <button class="btn active" onclick="zoomOverview()">Full Panorama</button>
-      <button class="btn" onclick="zoomBoat()">The Boat</button>
-      <button class="btn" onclick="zoomMonument()">Monument & Cliffs</button>
+      <button class="btn" onclick="zoomTarget1()">{preset1_name}</button>
+      <button class="btn" onclick="zoomTarget2()">{preset2_name}</button>
       <button class="btn" onclick="zoomNative()">1:1 Native Resolution</button>
     </div>
     <div id="openseadragon"></div>
@@ -707,15 +730,13 @@ class VisualAuditor:
     function zoomOverview() {{
       viewer.viewport.goHome();
     }}
-    function zoomBoat() {{
-      // Coordinates normalized relative to width: x=4750/9728≈0.488, y=1450/9728≈0.149
-      viewer.viewport.panTo(new OpenSeadragon.Point(0.488, 0.149));
-      viewer.viewport.zoomTo(3.2);
+    function zoomTarget1() {{
+      viewer.viewport.panTo(new OpenSeadragon.Point({p1_x}, {p1_y}));
+      viewer.viewport.zoomTo({p1_zoom});
     }}
-    function zoomMonument() {{
-      // Coordinates normalized relative to width: x=2420/9728≈0.249, y=550/9728≈0.056
-      viewer.viewport.panTo(new OpenSeadragon.Point(0.249, 0.056));
-      viewer.viewport.zoomTo(2.8);
+    function zoomTarget2() {{
+      viewer.viewport.panTo(new OpenSeadragon.Point({p2_x}, {p2_y}));
+      viewer.viewport.zoomTo({p2_zoom});
     }}
     function zoomNative() {{
       viewer.viewport.zoomTo(viewer.viewport.imageToViewportZoom(1.0));
