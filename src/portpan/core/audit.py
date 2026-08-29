@@ -198,34 +198,24 @@ class VisualAuditor:
         if rgba_raw is None:
             rgba_raw = ap.extract_rgba(target_img, feather_px=2.0)
 
-        # 1. Clean boundary inset: Erode alpha by 18px with smooth 8px cosine/linear taper
+        # 1. Clean boundary inset: Erode alpha by 18px with smooth 10px cosine taper
         # This completely eliminates any physical contact with the rubber eyecup, dark casing, or chromatic fringing
-        alpha_orig = rgba_raw[:, :, 3]
+        alpha_orig = rgba_raw[:, :, 3].astype(np.float32)
         dist = cv2.distanceTransform((alpha_orig > 128).astype(np.uint8), cv2.DIST_L2, 5)
-        clean_mask = np.clip((dist - 18.0) / 8.0, 0.0, 1.0)
+        clean_mask = np.clip((dist - 18.0) / 10.0, 0.0, 1.0)
+        clean_mask = 0.5 * (1.0 - np.cos(np.pi * clean_mask))
 
-        # 2. Sky halo suppression: detect flat blue sky regions in the porthole and suppress alpha to 0
-        # so the clean, uniform base panorama sky is never polluted with circular vignette bubbles
         rgb = rgba_raw[:, :, :3]
-        gray = cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY)
-        b, g, r = cv2.split(rgb)
-        is_blue_sky = (gray > 125) & (b.astype(np.int32) > r.astype(np.int32) + 20)
-
-        # Calculate local gradient texture energy
-        lap = cv2.Laplacian(gray, cv2.CV_32F)
-        lap_energy = cv2.boxFilter(lap ** 2, -1, (21, 21))
-        flat_sky = is_blue_sky & (lap_energy < 12.0)
-        clean_mask[flat_sky] = 0.0
-
-        # Construct clean RGBA
         rgba_clean = rgb.copy()
         rgba_clean[clean_mask == 0] = 0
         alpha_channel = (clean_mask * 255.0).astype(np.uint8)
         rgba_clean = np.dstack([rgba_clean, alpha_channel])
 
-        # Compute central saliency (Laplacian variance on non-sky core)
-        core_pts = (dist > (dist.max() * 0.40)) & (~flat_sky)
+        # Compute central saliency (Laplacian variance on non-zero core)
+        core_pts = dist > (dist.max() * 0.35)
         if np.any(core_pts):
+            gray = cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY)
+            lap = cv2.Laplacian(gray, cv2.CV_32F)
             saliency = float(np.var(lap[core_pts]))
         else:
             saliency = 10.0
@@ -373,13 +363,21 @@ class VisualAuditor:
             higher = (w_q > q_curr) & (w_mask > 0.01)
 
             if np.any(higher):
+                # Multi-band detail fusion: match low-frequency illumination to canvas, eliminating veiling glare
+                # while preserving 100% of native optical sensor sharpness and contrast on landmarks
+                ksize = 61
+                tgt_low = cv2.GaussianBlur(w_target, (ksize, ksize), 0)
+                canvas_low = cv2.GaussianBlur(composite[y_min:y_max, x_min:x_max], (ksize, ksize), 0)
+                matched_target = canvas_low + (w_target - tgt_low)
+
                 alpha = np.zeros_like(w_q)
                 alpha[higher] = np.clip(0.6 + (w_q[higher] - q_curr[higher]) / (2.0 * np.maximum(w_q[higher], 1e-4)), 0.6, 1.0) * w_mask[higher]
                 alpha_3d = alpha[:, :, np.newaxis]
 
                 c_roi = composite[y_min:y_max, x_min:x_max]
-                composite[y_min:y_max, x_min:x_max] = c_roi * (1.0 - alpha_3d) + w_target * alpha_3d
+                composite[y_min:y_max, x_min:x_max] = c_roi * (1.0 - alpha_3d) + matched_target * alpha_3d
                 priority_map[y_min:y_max, x_min:x_max] = np.maximum(q_curr, w_q)
+                del tgt_low, canvas_low, matched_target
 
             del rgba_clean, clean_mask, quality_weight, w_rgba, w_target, w_mask, w_q
 
@@ -547,14 +545,23 @@ class VisualAuditor:
             higher = (w_q > q_curr) & (w_mask > 0.01)
 
             if np.any(higher):
+                c_roi = master_canvas[y_min:y_max, x_min:x_max].astype(np.float32)
+
+                # Multi-band detail fusion: match low-frequency illumination to canvas, eliminating veiling glare
+                # while preserving 100% of native optical sensor sharpness and contrast on landmarks
+                ksize = 61
+                tgt_low = cv2.GaussianBlur(w_tgt, (ksize, ksize), 0)
+                canvas_low = cv2.GaussianBlur(c_roi, (ksize, ksize), 0)
+                matched_tgt = canvas_low + (w_tgt - tgt_low)
+
                 alpha = np.zeros_like(w_q)
                 alpha[higher] = np.clip(0.6 + (w_q[higher] - q_curr[higher]) / (2.0 * np.maximum(w_q[higher], 1e-4)), 0.6, 1.0) * w_mask[higher]
                 alpha_3d = alpha[:, :, np.newaxis]
 
-                c_roi = master_canvas[y_min:y_max, x_min:x_max].astype(np.float32)
-                comp_roi = c_roi * (1.0 - alpha_3d) + w_tgt * alpha_3d
+                comp_roi = c_roi * (1.0 - alpha_3d) + matched_tgt * alpha_3d
                 master_canvas[y_min:y_max, x_min:x_max] = np.clip(comp_roi, 0, 255).astype(np.uint8)
                 priority_map[y_min:y_max, x_min:x_max] = np.maximum(q_curr, w_q)
+                del tgt_low, canvas_low, matched_tgt, c_roi, comp_roi
 
             del rgba_clean, clean_mask, q_weight, w_rgba, w_tgt, w_mask, w_q
 
