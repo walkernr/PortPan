@@ -101,7 +101,8 @@ def animate(
     output_video: Path | None = typer.Option(None, help="Custom output video path"),
     loop_frames: int = typer.Option(60, help="Number of frames in the seamless loop"),
     fps: float = typer.Option(30.0, help="Frames per second of the output video"),
-    canvas_scale: float = typer.Option(1.5, help="Canvas super-resolution scaling factor (e.g. 1.0, 1.5, 2.0)"),
+    canvas_scale: float = typer.Option(1.0, help="Canvas super-resolution scaling factor (e.g. 1.0, 1.5, 2.0)"),
+    max_dimension: int = typer.Option(3840, help="Maximum video dimension for standard 4K compatibility (0 for unconstrained)"),
 ) -> None:
     """Synthesize a synchronized, seamlessly looping master video with animated portholes over the base panorama."""
     from portpan.video.canvas_animator import CanvasVideoAnimator
@@ -113,7 +114,7 @@ def animate(
 
     out_path = output_video or (Path("output") / location_name / f"{location_name}_animated_loop.mp4")
     console.print(f"[bold cyan]Synthesizing animated canvas video for:[/bold cyan] {location_name}")
-    console.print(f"Canvas scale: [bold]{canvas_scale}x[/bold], Loop length: [bold]{loop_frames} frames[/bold] @ [bold]{fps} fps[/bold]")
+    console.print(f"Canvas scale: [bold]{canvas_scale}x[/bold], Loop length: [bold]{loop_frames} frames[/bold] @ [bold]{fps} fps[/bold], Max dimension: [bold]{max_dimension}[/bold]")
 
     animator = CanvasVideoAnimator()
     exported_path = animator.animate_location(
@@ -122,6 +123,7 @@ def animate(
         loop_frames=loop_frames,
         fps=fps,
         canvas_scale=canvas_scale,
+        max_dimension=max_dimension if max_dimension > 0 else None,
     )
 
     console.print(f"[bold green]Successfully generated animated video:[/bold green] {exported_path}")
